@@ -115,6 +115,7 @@ class ProviderPresetTestCase(unittest.TestCase):
                 )
                 self.assertEqual(spec.prompt_transport, "stdin")
                 self.assertEqual(spec.capabilities, ("repo-read",))
+                self.assertEqual(spec.provider_id, preset_id)
                 self.assertNotIn("bypassPermissions", spec.command)
                 self.assertNotIn("--yolo", spec.command)
                 self.assertNotIn("--dangerously-skip-permissions", spec.command)
@@ -300,6 +301,7 @@ class ProviderPresetTestCase(unittest.TestCase):
             (str(executable.resolve()),) + EXPECTED_ARGUMENTS["codex-cli"],
         )
         self.assertEqual(registered.adapter_type, "cli")
+        self.assertEqual(registered.provider_id, "codex-cli")
         self.assertEqual(
             registered.config_home,
             ("CODEX_HOME", str(config_home.resolve())),

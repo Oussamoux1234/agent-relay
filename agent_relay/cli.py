@@ -9,10 +9,11 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 
+from .adapters import AgentExecutionResult
 from .errors import RelayError
 from .models import AgentSpec
 from .presets import PRESETS, build_preset, list_preset_statuses
-from .service import HandoffOutcome, RelayService
+from .service import HandoffOutcome, RelayService, RouteOutcome
 from .storage import RelayStore
 
 
@@ -49,16 +50,46 @@ def _handoff_to_dict(outcome: HandoffOutcome, include_prompt: bool) -> Dict[str,
     if include_prompt:
         value["prompt"] = outcome.prompt
     if outcome.execution is not None:
-        value["execution"] = {
-            "status": outcome.execution.status,
-            "return_code": outcome.execution.return_code,
-            "elapsed_ms": outcome.execution.elapsed_ms,
-            "started": outcome.execution.started,
-            "timed_out": outcome.execution.timed_out,
-            "error": outcome.execution.error,
-            "stdout": outcome.execution.stdout,
-            "stderr": outcome.execution.stderr,
-        }
+        value["execution"] = _execution_to_dict(outcome.execution)
+    return value
+
+
+def _execution_to_dict(execution: AgentExecutionResult) -> Dict[str, Any]:
+    return {
+        "status": execution.status,
+        "return_code": execution.return_code,
+        "elapsed_ms": execution.elapsed_ms,
+        "started": execution.started,
+        "timed_out": execution.timed_out,
+        "error": execution.error,
+        "stdout": execution.stdout,
+        "stderr": execution.stderr,
+    }
+
+
+def _route_to_dict(outcome: RouteOutcome, include_prompt: bool) -> Dict[str, Any]:
+    value: Dict[str, Any] = {
+        "dry_run": outcome.dry_run,
+        "task_id": outcome.task.task_id,
+        "task_status": outcome.task.status,
+        "active_agent": outcome.task.active_agent,
+        "revision": outcome.task.revision,
+        "routing_order": list(outcome.task.routing_order),
+        "candidates": list(outcome.candidates),
+        "attempts": [
+            {
+                "agent_id": attempt.agent_id,
+                "action_id": attempt.action_id,
+                "classification": attempt.classification.category,
+                "evidence_code": attempt.classification.evidence_code,
+                "safe_to_fallback": attempt.classification.safe_to_fallback,
+                "execution": _execution_to_dict(attempt.execution),
+            }
+            for attempt in outcome.attempts
+        ],
+    }
+    if include_prompt:
+        value["prompt"] = outcome.prompt
     return value
 
 
@@ -137,6 +168,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="include the full checkpoint prompt in executed handoff output",
     )
 
+    route = commands.add_parser("route", help="manage safe ordered fallback routing")
+    route_commands = route.add_subparsers(dest="route_command", required=True)
+    route_set = route_commands.add_parser("set", help="set the ordered agents for a task")
+    route_set.add_argument("task_id")
+    route_set.add_argument(
+        "--agent",
+        action="append",
+        required=True,
+        help="agent id in priority order; repeat at least twice",
+    )
+    route_show = route_commands.add_parser("show", help="show a task's route")
+    route_show.add_argument("task_id")
+    route_run = route_commands.add_parser("run", help="preview or execute a task's route")
+    route_run.add_argument("task_id")
+    route_run.add_argument("--execute", action="store_true")
+    route_run.add_argument("--cwd", default=".")
+    route_run.add_argument(
+        "--show-prompt",
+        action="store_true",
+        help="include the last checkpoint prompt in executed route output",
+    )
+
     resolve = commands.add_parser("resolve", help="resolve an unknown handoff outcome")
     resolve.add_argument("task_id")
     resolve.add_argument("action_id")
@@ -203,6 +256,29 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             return _handoff_to_dict(outcome, include_prompt=args.show_prompt)
         outcome = service.preview_handoff(args.task_id, args.target_agent)
         return _handoff_to_dict(outcome, include_prompt=True)
+    if args.command_name == "route" and args.route_command == "set":
+        checkpoint = service.configure_route(args.task_id, args.agent)
+        return {
+            "task_id": checkpoint.task_id,
+            "active_agent": checkpoint.active_agent,
+            "revision": checkpoint.revision,
+            "routing_order": list(checkpoint.routing_order),
+        }
+    if args.command_name == "route" and args.route_command == "show":
+        checkpoint = service.store.get_task(args.task_id)
+        return {
+            "task_id": checkpoint.task_id,
+            "active_agent": checkpoint.active_agent,
+            "task_status": checkpoint.status,
+            "revision": checkpoint.revision,
+            "routing_order": list(checkpoint.routing_order),
+        }
+    if args.command_name == "route" and args.route_command == "run":
+        if args.execute:
+            outcome = service.run_route(args.task_id, Path(args.cwd))
+            return _route_to_dict(outcome, include_prompt=args.show_prompt)
+        outcome = service.preview_route(args.task_id)
+        return _route_to_dict(outcome, include_prompt=True)
     if args.command_name == "resolve":
         checkpoint = service.resolve_action(args.task_id, args.action_id, args.resolution)
         return {"task": checkpoint.to_dict()}

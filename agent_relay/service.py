@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from .adapters import (
     AdapterRegistry,
@@ -14,6 +14,7 @@ from .adapters import (
     CliAgentAdapter,
 )
 from .errors import ConflictError, NotFoundError, ValidationError
+from .failures import FailureClassification, FailureClassifier
 from .models import ActionRecord, AgentSpec, TaskCheckpoint, utc_now
 from .prompting import CheckpointPromptRenderer
 from .storage import RelayStore
@@ -30,6 +31,32 @@ class HandoffOutcome:
     execution: Optional[AgentExecutionResult] = None
 
 
+@dataclass(frozen=True)
+class RouteAttempt:
+    """One auditable execution within an ordered route."""
+
+    agent_id: str
+    action_id: str
+    classification: FailureClassification
+    execution: AgentExecutionResult
+
+
+@dataclass(frozen=True)
+class RouteOutcome:
+    """Preview or execution result for a task's configured route."""
+
+    task: TaskCheckpoint
+    candidates: Tuple[str, ...]
+    attempts: Tuple[RouteAttempt, ...]
+    prompt: str
+    dry_run: bool
+
+
+AUTO_ROUTE_PROVIDER_IDS = frozenset(
+    ("antigravity-cli", "claude-code", "codex-cli", "gemini-cli")
+)
+
+
 class RelayService:
     """Coordinates safe, provider-neutral handoffs between registered runtimes."""
 
@@ -39,6 +66,7 @@ class RelayService:
         adapter: Optional[CliAgentAdapter] = None,
         renderer: Optional[CheckpointPromptRenderer] = None,
         adapter_registry: Optional[AdapterRegistry] = None,
+        classifier: Optional[FailureClassifier] = None,
     ) -> None:
         self.store = store
         if adapter is not None and adapter_registry is not None:
@@ -52,6 +80,7 @@ class RelayService:
         else:
             self.adapter = None
         self.renderer = renderer or CheckpointPromptRenderer()
+        self.classifier = classifier or FailureClassifier()
 
     def register_agent(self, spec: AgentSpec, replace: bool = False) -> AgentSpec:
         self.adapters.get(spec.adapter_type)
@@ -168,6 +197,139 @@ class RelayService:
             execution=execution,
         )
 
+    def configure_route(self, task_id: str, routing_order: List[str]) -> TaskCheckpoint:
+        """Persist an explicit, analysis-only fallback order for a task."""
+
+        checkpoint = self.store.get_task(task_id)
+        if checkpoint.status == "completed":
+            raise ConflictError("completed tasks cannot be routed")
+        if checkpoint.unresolved_actions():
+            raise ConflictError("resolve the task's pending or unknown action before routing")
+        if checkpoint.active_agent is None:
+            raise ValidationError("task must have an active agent before routing")
+        if not isinstance(routing_order, list) or len(routing_order) < 2:
+            raise ValidationError("routing_order must contain at least two agents")
+        if len(routing_order) > 16:
+            raise ValidationError("routing_order must not contain more than 16 agents")
+        if len(routing_order) != len(set(routing_order)):
+            raise ValidationError("routing_order must not contain duplicate agents")
+        if routing_order[0] != checkpoint.active_agent:
+            raise ValidationError("routing_order must start with the task's active agent")
+
+        for agent_id in routing_order:
+            self._get_safe_routing_agent(agent_id)
+
+        expected_revision = checkpoint.revision
+        checkpoint.routing_order = list(routing_order)
+        checkpoint.status = "active"
+        checkpoint.__post_init__()
+        return self.store.save_task(checkpoint, expected_revision)
+
+    def preview_route(self, task_id: str) -> RouteOutcome:
+        checkpoint = self.store.get_task(task_id)
+        candidates = self._route_candidates(checkpoint)
+        prompt = self.renderer.render(checkpoint, candidates[0])
+        return RouteOutcome(
+            task=checkpoint,
+            candidates=candidates,
+            attempts=(),
+            prompt=prompt,
+            dry_run=True,
+        )
+
+    def run_route(self, task_id: str, working_directory: Path) -> RouteOutcome:
+        """Run an ordered route, continuing only after a safe classified failure."""
+
+        checkpoint = self.store.get_task(task_id)
+        candidates = self._route_candidates(checkpoint)
+        configured_order = tuple(checkpoint.routing_order)
+        starting_agent = checkpoint.active_agent
+        attempts: List[RouteAttempt] = []
+        last_prompt = ""
+
+        for position, agent_id in enumerate(candidates):
+            checkpoint = self.store.get_task(task_id)
+            if (
+                tuple(checkpoint.routing_order) != configured_order
+                or checkpoint.active_agent != starting_agent
+            ):
+                raise ConflictError("task route changed while fallback execution was in progress")
+            if checkpoint.unresolved_actions():
+                raise ConflictError("task gained an unresolved action during fallback execution")
+            target = self._get_safe_routing_agent(agent_id)
+            runtime_adapter = self.adapters.get(target.adapter_type)
+            action = ActionRecord(
+                action_id=uuid.uuid4().hex,
+                kind="route-run",
+                agent_id=agent_id,
+                status="pending",
+                started_at=utc_now(),
+                details={
+                    "source_agent": checkpoint.active_agent,
+                    "route_position": checkpoint.routing_order.index(agent_id),
+                },
+            )
+            expected_revision = checkpoint.revision
+            checkpoint.actions.append(action)
+            last_prompt = self.renderer.render(checkpoint, agent_id)
+            resolved_directory = runtime_adapter.validate_execution(
+                target,
+                last_prompt,
+                working_directory,
+            )
+            self.store.save_task(checkpoint, expected_revision)
+
+            execution = runtime_adapter.execute(target, last_prompt, resolved_directory)
+            classification = self.classifier.classify(target, execution)
+
+            checkpoint = self.store.get_task(task_id)
+            expected_revision = checkpoint.revision
+            persisted_action = self._find_action(checkpoint, action.action_id)
+            if persisted_action.status != "pending":
+                raise ConflictError("route action changed while the agent was running")
+            persisted_action.finished_at = utc_now()
+            persisted_action.details.update(
+                {
+                    "classification": classification.category,
+                    "evidence_code": classification.evidence_code,
+                    "elapsed_ms": execution.elapsed_ms,
+                    "return_code": execution.return_code,
+                    "timed_out": execution.timed_out,
+                }
+            )
+
+            has_next = position + 1 < len(candidates)
+            if execution.status == "completed":
+                persisted_action.status = "completed"
+                checkpoint.active_agent = agent_id
+                checkpoint.status = "active"
+            elif classification.safe_to_fallback:
+                persisted_action.status = "failed"
+                checkpoint.status = "active" if has_next else "blocked"
+            else:
+                persisted_action.status = "unknown"
+                checkpoint.status = "blocked"
+
+            checkpoint = self.store.save_task(checkpoint, expected_revision)
+            attempts.append(
+                RouteAttempt(
+                    agent_id=agent_id,
+                    action_id=action.action_id,
+                    classification=classification,
+                    execution=execution,
+                )
+            )
+            if execution.status == "completed" or not classification.safe_to_fallback or not has_next:
+                return RouteOutcome(
+                    task=checkpoint,
+                    candidates=candidates,
+                    attempts=tuple(attempts),
+                    prompt=last_prompt,
+                    dry_run=False,
+                )
+
+        raise AssertionError("configured route contained no candidates")
+
     def resolve_action(self, task_id: str, action_id: str, resolution: str) -> TaskCheckpoint:
         if resolution not in {"completed", "failed", "cancelled"}:
             raise ValidationError("resolution must be completed, failed, or cancelled")
@@ -179,7 +341,7 @@ class RelayService:
         action.status = resolution
         action.finished_at = utc_now()
         action.details["resolved_manually"] = True
-        if resolution == "completed" and action.kind == "handoff":
+        if resolution == "completed" and action.kind in {"handoff", "route-run"}:
             checkpoint.active_agent = action.agent_id
         checkpoint.status = "blocked" if checkpoint.unresolved_actions() else "active"
         return self.store.save_task(checkpoint, expected_revision)
@@ -196,6 +358,38 @@ class RelayService:
                 "task has an unresolved action (%s); resolve it before another handoff"
                 % unresolved[0].action_id
             )
+
+    def _route_candidates(self, checkpoint: TaskCheckpoint) -> Tuple[str, ...]:
+        if checkpoint.status == "completed":
+            raise ConflictError("completed tasks cannot be routed")
+        unresolved = checkpoint.unresolved_actions()
+        if unresolved:
+            raise ConflictError(
+                "task has an unresolved action (%s); resolve it before routing"
+                % unresolved[0].action_id
+            )
+        if not checkpoint.routing_order:
+            raise ValidationError("task has no route; configure one with route set")
+        if checkpoint.active_agent not in checkpoint.routing_order:
+            raise ConflictError("task's active agent is not present in its routing_order")
+        active_position = checkpoint.routing_order.index(checkpoint.active_agent)
+        candidates = tuple(checkpoint.routing_order[active_position:])
+        for agent_id in candidates:
+            self._get_safe_routing_agent(agent_id)
+        return candidates
+
+    def _get_safe_routing_agent(self, agent_id: str) -> AgentSpec:
+        spec = self.store.get_agent(agent_id)
+        self.adapters.get(spec.adapter_type)
+        if spec.provider_id not in AUTO_ROUTE_PROVIDER_IDS:
+            raise ValidationError(
+                "automatic routing requires a supported built-in preset: %s" % agent_id
+            )
+        if spec.capabilities != ("repo-read",):
+            raise ValidationError(
+                "automatic routing is limited to repo-read agent presets: %s" % agent_id
+            )
+        return spec
 
     @staticmethod
     def _find_action(checkpoint: TaskCheckpoint, action_id: str) -> ActionRecord:

@@ -17,7 +17,10 @@ The MVP answers one question: **can a user register arbitrary agents and move a 
 - Preview the exact prompt before a handoff.
 - Execute a handoff without invoking a shell.
 - Record every handoff as pending before the target process starts.
-- Mark timeouts and non-zero exits as `unknown` and block further handoffs until the user resolves the outcome.
+- Mark manual-handoff timeouts and non-zero exits as `unknown` and block further handoffs until the user resolves the outcome.
+- Configure an ordered route across Codex, Claude, Gemini, and Antigravity preset instances.
+- Continue to the next read-only agent after a documented quota/rate-limit signal or a process that could not start.
+- Fail closed on authentication, timeout, overload, and unrecognized routed failures.
 - Persist local state atomically with owner-only permissions where the filesystem supports them.
 
 Agent Relay does not claim to transfer a model's hidden reasoning or private session. It transfers an auditable set of facts about the task.
@@ -32,7 +35,8 @@ User ──> Relay service contract ──┼─ Claude Code adapter
               │                   └─ custom command adapter
               │
               ├─ versioned checkpoint
-              └─ action ledger
+              ├─ ordered fallback policy
+              └─ action ledger + redacted failure class
 ```
 
 `AgentSpec` identifies the runtime type, and `AdapterRegistry` resolves it to an implementation. `CliAgentAdapter` launches a configured argv list with `shell=False`. Future API and application-extension adapters can be added without changing checkpoint persistence or handoff policy.
@@ -158,7 +162,39 @@ python3 -m agent_relay agent add-preset claude-code \
   --id claude-backup --config-home "$HOME/.claude-backup"
 ```
 
-The active task can then hand off from `codex-primary` to `codex-backup`, or from `claude-primary` to `claude-backup`, because each registration has a unique agent ID. For file-based Codex account isolation, configure `cli_auth_credentials_store = "file"` inside each Codex home; never commit either provider directory.
+The active task can then hand off or route from `codex-primary` to `codex-backup`, or from `claude-primary` to `claude-backup`, because each registration has a unique agent ID. For file-based Codex account isolation, configure `cli_auth_credentials_store = "file"` inside each Codex home; never commit either provider directory.
+
+## Safe ordered fallback routing
+
+Set an explicit priority order. The first agent must be the task's current active agent, and every entry must come from a supported built-in read-only preset:
+
+```bash
+python3 -m agent_relay route set TASK_ID \
+  --agent codex-primary \
+  --agent codex-backup \
+  --agent claude-primary \
+  --agent gemini-cli
+
+python3 -m agent_relay route show TASK_ID
+```
+
+Preview the candidate order and exact checkpoint prompt without launching an agent:
+
+```bash
+python3 -m agent_relay route run TASK_ID
+```
+
+Execute the route after checking the preview:
+
+```bash
+python3 -m agent_relay route run TASK_ID --execute --cwd .
+```
+
+Relay invokes the active CLI agent first. If that process exits with a recognized quota or rate-limit signal, Relay records a redacted failure class and immediately invokes the next candidate with the shared checkpoint. A process that cannot be launched is also skipped safely because it could not have performed work. A successful candidate becomes the task's active agent; later runs start there and continue only through the remaining route entries.
+
+The detector recognizes documented signals such as OpenAI 429/quota codes, Claude `rate_limit_error`, and Gemini `429 RESOURCE_EXHAUSTED`. Authentication or payment errors, timeouts, overloads, and unrecognized non-zero exits block the task instead of launching another process. These rules follow the official [OpenAI error-code guide](https://developers.openai.com/api/docs/guides/error-codes), [Claude API error reference](https://platform.claude.com/docs/en/api/errors), and [Gemini troubleshooting guide](https://ai.google.dev/gemini-api/docs/troubleshooting).
+
+Only classifications and execution metadata are persisted; raw stdout and stderr are returned to the invoking user but are not written into the task ledger. Automatic routing currently applies to Relay-launched CLI processes. It cannot observe a limit encountered inside an unrelated Codex App, Claude Code, or Antigravity session.
 
 ## Update the shared checkpoint
 
@@ -188,13 +224,16 @@ The GitHub Actions workflow runs the same suite on Python 3.9 through 3.14 with 
 
 ## Deliberate MVP boundaries
 
-- Handoffs are user-confirmed; automatic provider-limit detection comes later.
+- Manual handoffs remain user-confirmed; ordered CLI routes can automatically continue only after conservative limit classification.
 - The adapter launches CLI processes but does not scrape or impersonate consumer subscriptions.
 - All built-in provider presets are read-only or plan-only; a workspace-write profile is not enabled yet.
 - Codex App task control is not implemented; the current Codex integration is CLI-based.
 - The checkpoint is updated through Relay commands; automatic diff and test harvesting is a follow-up.
+- Provider cooldown windows and automatic return to an earlier route entry are not implemented yet.
 - State is local JSON and optimized for one writer. A service deployment will need transactional storage and stronger concurrency control.
 - There is no HTTP API or graphical interface yet.
+
+Work is tracked in [GitHub Issues](https://github.com/Oussamoux1234/agent-relay/issues), with one scoped issue per milestone.
 
 ## License
 
@@ -202,4 +241,4 @@ Agent Relay is licensed under the [Apache License 2.0](LICENSE).
 
 ## Next milestone
 
-Add provider error classification for real quota and rate-limit signals, then let a routing policy propose the next available registered agent. The first version should simulate and log the decision before automatic handoff is enabled. After that, harvest verified diffs and test results back into the shared checkpoint, and only then add explicitly scoped workspace-write profiles.
+[Harvest structured, verified agent results](https://github.com/Oussamoux1234/agent-relay/issues/4) back into the shared checkpoint so the next routed run starts with fresh summaries, files, and test evidence. After that, add provider cooldown/health state, Codex App integration, and explicitly approved workspace-write profiles as separate milestones.

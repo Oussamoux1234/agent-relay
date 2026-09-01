@@ -9,6 +9,9 @@ import unittest
 from pathlib import Path
 
 from agent_relay.cli import main
+from agent_relay.models import AgentSpec
+from agent_relay.service import RelayService
+from agent_relay.storage import RelayStore
 
 
 class CliTestCase(unittest.TestCase):
@@ -90,6 +93,53 @@ class CliTestCase(unittest.TestCase):
         self.assertEqual(status, 2)
         parsed = json.loads(error)
         self.assertEqual(parsed["error_type"], "ValidationError")
+
+    def test_cli_can_set_show_and_preview_a_route(self) -> None:
+        service = RelayService(RelayStore(Path(self.state_dir)))
+        for agent_id, provider_id in (
+            ("codex-primary", "codex-cli"),
+            ("claude-backup", "claude-code"),
+        ):
+            service.register_agent(
+                AgentSpec(
+                    agent_id=agent_id,
+                    display_name=agent_id,
+                    command=(sys.executable, "-c", "print('ok')"),
+                    capabilities=("repo-read",),
+                    provider_id=provider_id,
+                )
+            )
+        task = service.create_task(
+            "Route CLI",
+            "Keep the checkpoint portable",
+            active_agent="codex-primary",
+        )
+
+        status, output, _ = self.invoke(
+            "route",
+            "set",
+            task.task_id,
+            "--agent",
+            "codex-primary",
+            "--agent",
+            "claude-backup",
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            json.loads(output)["routing_order"],
+            ["codex-primary", "claude-backup"],
+        )
+
+        status, output, _ = self.invoke("route", "show", task.task_id)
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(output)["active_agent"], "codex-primary")
+
+        status, output, _ = self.invoke("route", "run", task.task_id)
+        self.assertEqual(status, 0)
+        preview = json.loads(output)
+        self.assertTrue(preview["dry_run"])
+        self.assertEqual(preview["attempts"], [])
+        self.assertIn("Keep the checkpoint portable", preview["prompt"])
 
 
 if __name__ == "__main__":

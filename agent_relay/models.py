@@ -60,6 +60,7 @@ class AgentSpec:
     env_allowlist: Tuple[str, ...] = ()
     adapter_type: str = "cli"
     config_home: Optional[Tuple[str, str]] = None
+    provider_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.agent_id, str) or AGENT_ID_PATTERN.fullmatch(self.agent_id) is None:
@@ -107,6 +108,12 @@ class AgentSpec:
                 raise ValidationError("config_home path must not have surrounding whitespace")
             if not Path(directory).is_absolute():
                 raise ValidationError("config_home path must be absolute")
+        if self.provider_id is not None:
+            if (
+                not isinstance(self.provider_id, str)
+                or AGENT_ID_PATTERN.fullmatch(self.provider_id) is None
+            ):
+                raise ValidationError("provider_id must be a lowercase identifier")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -126,6 +133,7 @@ class AgentSpec:
                 if self.config_home is not None
                 else None
             ),
+            "provider_id": self.provider_id,
         }
 
     @classmethod
@@ -161,6 +169,7 @@ class AgentSpec:
             capabilities=tuple(capabilities),
             env_allowlist=tuple(env_allowlist),
             config_home=config_home,
+            provider_id=value.get("provider_id"),
         )
 
 
@@ -273,6 +282,7 @@ class TaskCheckpoint:
     updated_at: str
     actions: List[ActionRecord] = field(default_factory=list)
     schema_version: str = SCHEMA_VERSION
+    routing_order: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         _required_text(self.task_id, "task_id", max_length=64)
@@ -292,6 +302,16 @@ class TaskCheckpoint:
             raise ValidationError("state must be a TaskState")
         if not all(isinstance(action, ActionRecord) for action in self.actions):
             raise ValidationError("actions must contain ActionRecord values")
+        self.routing_order = _string_list(
+            self.routing_order,
+            "routing_order",
+            max_items=16,
+        )
+        for agent_id in self.routing_order:
+            if AGENT_ID_PATTERN.fullmatch(agent_id) is None:
+                raise ValidationError("routing_order contains an invalid agent_id")
+        if len(self.routing_order) != len(set(self.routing_order)):
+            raise ValidationError("routing_order must not contain duplicate agents")
 
     @classmethod
     def create(
@@ -330,6 +350,7 @@ class TaskCheckpoint:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "actions": [action.to_dict() for action in self.actions],
+            "routing_order": list(self.routing_order),
         }
 
     @classmethod
@@ -339,6 +360,9 @@ class TaskCheckpoint:
         action_values = value.get("actions", [])
         if not isinstance(action_values, list):
             raise ValidationError("checkpoint actions must be a list")
+        routing_order = value.get("routing_order", [])
+        if not isinstance(routing_order, list):
+            raise ValidationError("checkpoint routing_order must be a list")
         return cls(
             schema_version=value.get("schema_version"),
             task_id=value.get("task_id"),
@@ -351,4 +375,5 @@ class TaskCheckpoint:
             created_at=value.get("created_at"),
             updated_at=value.get("updated_at"),
             actions=[ActionRecord.from_dict(item) for item in action_values],
+            routing_order=routing_order,
         )

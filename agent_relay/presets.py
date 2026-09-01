@@ -181,4 +181,5 @@ def build_preset(
         timeout_seconds=timeout_seconds,
         capabilities=preset.capabilities,
         config_home=resolved_config_home,
+        provider_id=preset.preset_id,
     )
