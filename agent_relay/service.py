@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .adapters import (
     AdapterRegistry,
@@ -15,6 +16,12 @@ from .adapters import (
 )
 from .errors import ConflictError, NotFoundError, ValidationError
 from .failures import FailureClassification, FailureClassifier
+from .health import (
+    AgentHealthRecord,
+    CooldownPolicy,
+    format_utc,
+    utc_datetime_now,
+)
 from .models import (
     ActionRecord,
     AgentSpec,
@@ -61,6 +68,17 @@ class RouteOutcome:
     attempts: Tuple[RouteAttempt, ...]
     prompt: str
     dry_run: bool
+    skipped: Tuple[AgentHealthRecord, ...] = ()
+
+
+@dataclass(frozen=True)
+class RouteStatus:
+    """Read-only eligibility view for a task route at one instant."""
+
+    task: TaskCheckpoint
+    candidates: Tuple[str, ...]
+    skipped: Tuple[AgentHealthRecord, ...]
+    observed_at: datetime
 
 
 @dataclass(frozen=True)
@@ -90,6 +108,8 @@ class RelayService:
         adapter_registry: Optional[AdapterRegistry] = None,
         classifier: Optional[FailureClassifier] = None,
         result_extractor: Optional[StructuredResultExtractor] = None,
+        cooldown_policy: Optional[CooldownPolicy] = None,
+        clock: Optional[Callable[[], datetime]] = None,
     ) -> None:
         self.store = store
         if adapter is not None and adapter_registry is not None:
@@ -105,6 +125,8 @@ class RelayService:
         self.renderer = renderer or CheckpointPromptRenderer()
         self.classifier = classifier or FailureClassifier()
         self.result_extractor = result_extractor or StructuredResultExtractor()
+        self.cooldown_policy = cooldown_policy or CooldownPolicy()
+        self.clock = clock or utc_datetime_now
 
     def register_agent(self, spec: AgentSpec, replace: bool = False) -> AgentSpec:
         self.adapters.get(spec.adapter_type)
@@ -251,7 +273,9 @@ class RelayService:
 
     def preview_route(self, task_id: str) -> RouteOutcome:
         checkpoint = self.store.get_task(task_id)
-        candidates = self._route_candidates(checkpoint)
+        observed_at = self._now()
+        candidates, skipped = self._route_plan(checkpoint, observed_at)
+        self._assert_route_has_candidates(candidates)
         prompt = self.renderer.render(checkpoint, candidates[0])
         return RouteOutcome(
             task=checkpoint,
@@ -259,13 +283,29 @@ class RelayService:
             attempts=(),
             prompt=prompt,
             dry_run=True,
+            skipped=skipped,
+        )
+
+    def inspect_route(self, task_id: str) -> RouteStatus:
+        """Show route eligibility without requiring an available candidate."""
+
+        checkpoint = self.store.get_task(task_id)
+        observed_at = self._now()
+        candidates, skipped = self._route_plan(checkpoint, observed_at)
+        return RouteStatus(
+            task=checkpoint,
+            candidates=candidates,
+            skipped=skipped,
+            observed_at=observed_at,
         )
 
     def run_route(self, task_id: str, working_directory: Path) -> RouteOutcome:
         """Run an ordered route, continuing only after a safe classified failure."""
 
         checkpoint = self.store.get_task(task_id)
-        candidates = self._route_candidates(checkpoint)
+        observed_at = self._now()
+        candidates, skipped = self._route_plan(checkpoint, observed_at)
+        self._assert_route_has_candidates(candidates)
         configured_order = tuple(checkpoint.routing_order)
         starting_agent = checkpoint.active_agent
         attempts: List[RouteAttempt] = []
@@ -305,6 +345,15 @@ class RelayService:
 
             execution = runtime_adapter.execute(target, last_prompt, resolved_directory)
             classification = self.classifier.classify(target, execution)
+            health_observed_at = self._now()
+            health_record = self.cooldown_policy.create_record(
+                target,
+                classification,
+                execution,
+                task_id,
+                action.action_id,
+                health_observed_at,
+            )
             extraction = ResultExtraction("not-applicable")
             if execution.status == "completed":
                 extraction = self.result_extractor.extract(
@@ -328,6 +377,14 @@ class RelayService:
                     "timed_out": execution.timed_out,
                 }
             )
+            if health_record is not None:
+                persisted_action.details.update(
+                    {
+                        "cooldown_until": health_record.cooldown_until,
+                        "cooldown_retry_source": health_record.retry_source,
+                        "cooldown_retry_signal_code": health_record.retry_signal_code,
+                    }
+                )
             if execution.status == "completed":
                 if extraction.status == "ready" and extraction.result is not None:
                     persisted_action.details.update(
@@ -357,6 +414,11 @@ class RelayService:
                 persisted_action.status = "unknown"
                 checkpoint.status = "blocked"
 
+            if execution.status == "completed":
+                self.store.clear_agent_health(agent_id)
+            elif health_record is not None:
+                self.store.set_agent_health(health_record)
+
             checkpoint = self.store.save_task(checkpoint, expected_revision)
             attempts.append(
                 RouteAttempt(
@@ -378,9 +440,73 @@ class RelayService:
                     attempts=tuple(attempts),
                     prompt=last_prompt,
                     dry_run=False,
+                    skipped=skipped,
                 )
 
         raise AssertionError("configured route contained no candidates")
+
+    def list_agent_health(self) -> Tuple[AgentHealthRecord, ...]:
+        """Return every persisted cooldown record in stable agent-id order."""
+
+        return tuple(self.store.list_agent_health())
+
+    def get_agent_health(self, agent_id: str) -> AgentHealthRecord:
+        """Return one cooldown record or a typed not-found error."""
+
+        self.store.get_agent(agent_id)
+        record = self.store.get_agent_health(agent_id)
+        if record is None:
+            raise NotFoundError("agent has no health record: %s" % agent_id)
+        return record
+
+    def clear_agent_health(self, agent_id: str) -> bool:
+        """Explicitly clear one provider-instance cooldown."""
+
+        self.store.get_agent(agent_id)
+        return self.store.clear_agent_health(agent_id)
+
+    def recover_route(self, task_id: str, target_agent: str) -> TaskCheckpoint:
+        """Explicitly move a task back to an earlier, currently eligible route entry."""
+
+        checkpoint = self.store.get_task(task_id)
+        observed_at = self._now()
+        self._route_plan(checkpoint, observed_at)
+        if target_agent not in checkpoint.routing_order:
+            raise ValidationError("recovery target is not present in the task route")
+        if checkpoint.active_agent is None:
+            raise ConflictError("task has no active agent to recover from")
+        current_position = checkpoint.routing_order.index(checkpoint.active_agent)
+        target_position = checkpoint.routing_order.index(target_agent)
+        if target_position >= current_position:
+            raise ConflictError("route recovery target must be earlier than the active agent")
+        self._get_safe_routing_agent(target_agent)
+        health = self.store.get_agent_health(target_agent)
+        if health is not None and health.is_active(observed_at):
+            raise ConflictError(
+                "recovery target is still cooling down; wait for expiry or clear its health"
+            )
+
+        expected_revision = checkpoint.revision
+        source_agent = checkpoint.active_agent
+        timestamp = format_utc(observed_at)
+        checkpoint.active_agent = target_agent
+        checkpoint.status = "active"
+        checkpoint.actions.append(
+            ActionRecord(
+                action_id=uuid.uuid4().hex,
+                kind="route-recover",
+                agent_id=target_agent,
+                status="completed",
+                started_at=timestamp,
+                finished_at=timestamp,
+                details={
+                    "source_agent": source_agent,
+                    "recovery": "explicit-user-command",
+                },
+            )
+        )
+        checkpoint.__post_init__()
+        return self.store.save_task(checkpoint, expected_revision)
 
     def preview_result(self, task_id: str, source_action_id: str) -> ResultPreview:
         checkpoint = self.store.get_task(task_id)
@@ -501,7 +627,11 @@ class RelayService:
                 % unresolved[0].action_id
             )
 
-    def _route_candidates(self, checkpoint: TaskCheckpoint) -> Tuple[str, ...]:
+    def _route_plan(
+        self,
+        checkpoint: TaskCheckpoint,
+        observed_at: datetime,
+    ) -> Tuple[Tuple[str, ...], Tuple[AgentHealthRecord, ...]]:
         if checkpoint.status == "completed":
             raise ConflictError("completed tasks cannot be routed")
         unresolved = checkpoint.unresolved_actions()
@@ -515,10 +645,31 @@ class RelayService:
         if checkpoint.active_agent not in checkpoint.routing_order:
             raise ConflictError("task's active agent is not present in its routing_order")
         active_position = checkpoint.routing_order.index(checkpoint.active_agent)
-        candidates = tuple(checkpoint.routing_order[active_position:])
-        for agent_id in candidates:
+        remaining = tuple(checkpoint.routing_order[active_position:])
+        candidates = []
+        skipped = []
+        for agent_id in remaining:
             self._get_safe_routing_agent(agent_id)
-        return candidates
+            health = self.store.get_agent_health(agent_id)
+            if health is not None and health.is_active(observed_at):
+                skipped.append(health)
+            else:
+                candidates.append(agent_id)
+        return tuple(candidates), tuple(skipped)
+
+    @staticmethod
+    def _assert_route_has_candidates(candidates: Tuple[str, ...]) -> None:
+        if not candidates:
+            raise ConflictError(
+                "all remaining route agents are cooling down; inspect with health list or "
+                "recover with health clear and route recover"
+            )
+
+    def _now(self) -> datetime:
+        observed_at = self.clock()
+        # format_utc provides a single validation path for naive or invalid clocks.
+        format_utc(observed_at)
+        return observed_at
 
     def _get_safe_routing_agent(self, agent_id: str) -> AgentSpec:
         spec = self.store.get_agent(agent_id)

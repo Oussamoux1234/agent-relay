@@ -20,6 +20,8 @@ The MVP answers one question: **can a user register arbitrary agents and move a 
 - Mark manual-handoff timeouts and non-zero exits as `unknown` and block further handoffs until the user resolves the outcome.
 - Configure an ordered route across Codex, Claude, Gemini, and Antigravity preset instances.
 - Continue to the next read-only agent after a documented quota/rate-limit signal or a process that could not start.
+- Persist redacted health per agent instance and skip entries whose cooldown is still active.
+- Inspect or clear cooldowns and explicitly recover a task to an earlier route entry.
 - Fail closed on authentication, timeout, overload, and unrecognized routed failures.
 - Extract bounded structured-result proposals from successful routed agents.
 - Preview proposed memory changes and accept them only with an unchanged checkpoint revision.
@@ -38,6 +40,7 @@ User ──> Relay service contract ──┼─ Claude Code adapter
               │
               ├─ versioned checkpoint
               ├─ ordered fallback policy
+              ├─ per-instance health + cooldown registry
               ├─ structured-result proposal
               └─ action ledger + redacted failure class/digest
 ```
@@ -195,7 +198,41 @@ python3 -m agent_relay route run TASK_ID --execute --cwd .
 
 Relay invokes the active CLI agent first. If that process exits with a recognized quota or rate-limit signal, Relay records a redacted failure class and immediately invokes the next candidate with the shared checkpoint. A process that cannot be launched is also skipped safely because it could not have performed work. A successful candidate becomes the task's active agent; later runs start there and continue only through the remaining route entries.
 
-The detector recognizes documented signals such as OpenAI 429/quota codes, Claude `rate_limit_error`, and Gemini `429 RESOURCE_EXHAUSTED`. Authentication or payment errors, timeouts, overloads, and unrecognized non-zero exits block the task instead of launching another process. These rules follow the official [OpenAI error-code guide](https://developers.openai.com/api/docs/guides/error-codes), [Claude API error reference](https://platform.claude.com/docs/en/api/errors), and [Gemini troubleshooting guide](https://ai.google.dev/gemini-api/docs/troubleshooting).
+Each failed instance also receives a record in the owner-only `health.json` registry. Before a route starts, Relay takes one deterministic snapshot of the remaining entries and omits every active cooldown. It visits each eligible entry at most once, never sleeps inside the route, and returns a conflict without launching anything when every remaining entry is cooling down.
+
+Inspect the current decision state:
+
+```bash
+python3 -m agent_relay health list
+python3 -m agent_relay health show codex-primary
+python3 -m agent_relay route show TASK_ID
+```
+
+The cooldown policy is deliberately conservative:
+
+- Complete JSON or JSON-lines output may supply a numeric `Retry-After` header field or a typed `google.rpc.RetryInfo.retry_delay`. If multiple valid hints exist, Relay uses the longest.
+- Arbitrary prose such as `retry in 20 minutes` is never parsed as a retry window.
+- A recognized transient rate limit without a structured hint gets a deterministic 60-second cooldown. An executable that could not start gets 300 seconds.
+- Quota, credit, usage, or spend exhaustion without a structured retry hint stays unavailable until the user explicitly clears it. This avoids repeatedly retrying a monthly or billing-bound limit.
+- Authentication, timeout, overload, and unknown failures remain fail-closed and do not create a cooldown that would hide the unresolved action.
+
+Cooldowns belong to agent IDs, not provider brands, so `codex-primary` and `codex-backup` can recover independently. Health records contain the agent/provider IDs, redacted classification codes, timestamps, and source task/action IDs; raw provider output and credentials are never persisted there.
+
+Clearing health is an explicit user override:
+
+```bash
+python3 -m agent_relay health clear codex-primary
+```
+
+It does not silently move a task backwards. After a successful fallback makes a later entry active, an earlier provider is considered again only after its cooldown expires or is cleared **and** the user records an explicit route recovery:
+
+```bash
+python3 -m agent_relay route recover TASK_ID codex-primary
+```
+
+Recovery changes only the active route pointer, writes an auditable `route-recover` action, and launches no provider process. The next `route run` remains preview-first unless `--execute` is supplied.
+
+The detector recognizes documented signals such as OpenAI 429/quota codes, Claude `rate_limit_error`, and Gemini `429 RESOURCE_EXHAUSTED`. The cooldown fields follow the official [OpenAI error-code guide](https://developers.openai.com/api/docs/guides/error-codes), [Claude rate-limit reference](https://platform.claude.com/docs/en/api/rate-limits), and [Google `RetryInfo` contract](https://docs.cloud.google.com/php/docs/reference/common-protos/latest/Rpc.RetryInfo). General classification also follows the [Claude API error reference](https://platform.claude.com/docs/en/api/errors) and [Gemini troubleshooting guide](https://ai.google.dev/gemini-api/docs/troubleshooting).
 
 Failure attempts persist only classifications and execution metadata. Successful attempts may persist a bounded, validated result proposal for review. Raw stdout and stderr are returned to the invoking user but are not written into the task ledger. Automatic routing currently applies to Relay-launched CLI processes. It cannot observe a limit encountered inside an unrelated Codex App, Claude Code, or Antigravity session.
 
@@ -262,7 +299,7 @@ The GitHub Actions workflow runs the same suite on Python 3.9 through 3.14 with 
 - All built-in provider presets are read-only or plan-only; a workspace-write profile is not enabled yet.
 - Codex App task control is not implemented; the current Codex integration is CLI-based.
 - Structured result fields are agent-reported and user-approved; automatic filesystem diff and test verification is not implemented yet.
-- Provider cooldown windows and automatic return to an earlier route entry are not implemented yet.
+- Cooldown health is local JSON and shared across tasks that use the same agent ID; cross-machine health synchronization is not implemented yet.
 - State is local JSON and optimized for one writer. A service deployment will need transactional storage and stronger concurrency control.
 - There is no HTTP API or graphical interface yet.
 
@@ -274,4 +311,4 @@ Agent Relay is licensed under the [Apache License 2.0](LICENSE).
 
 ## Next milestone
 
-[Track provider cooldowns and route recovery](https://github.com/Oussamoux1234/agent-relay/issues/5) so recently limited agents are skipped until their documented retry window expires. Codex App integration and explicitly approved workspace-write profiles remain separate later milestones.
+[Design the Codex App connector](https://github.com/Oussamoux1234/agent-relay/issues/6) around an official integration boundary while keeping the explicit checkpoint as shared memory. Explicitly approved workspace-write profiles and GitHub Education/Copilot support remain separate later milestones.

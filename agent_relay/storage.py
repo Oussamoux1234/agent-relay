@@ -6,9 +6,10 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .errors import ConflictError, NotFoundError, ValidationError
+from .health import AgentHealthRecord, HEALTH_SCHEMA_VERSION, MAX_HEALTH_RECORDS
 from .models import AgentSpec, SCHEMA_VERSION, TaskCheckpoint, utc_now
 
 
@@ -18,6 +19,7 @@ class RelayStore:
     def __init__(self, root: Path) -> None:
         self.root = Path(root).expanduser().resolve()
         self.registry_path = self.root / "agents.json"
+        self.health_path = self.root / "health.json"
         self.tasks_dir = self.root / "tasks"
         self._ensure_private_directory(self.root)
         self._ensure_private_directory(self.tasks_dir)
@@ -103,6 +105,53 @@ class RelayStore:
     def list_agents(self) -> List[AgentSpec]:
         registry = self._read_registry()
         return [AgentSpec.from_dict(value) for _, value in sorted(registry["agents"].items())]
+
+    def _read_health(self) -> Dict[str, Any]:
+        if not self.health_path.exists():
+            return {"schema_version": HEALTH_SCHEMA_VERSION, "agents": {}}
+        health = self._read_json(self.health_path)
+        if health.get("schema_version") != HEALTH_SCHEMA_VERSION:
+            raise ValidationError("unsupported health registry schema_version")
+        agents = health.get("agents")
+        if not isinstance(agents, dict):
+            raise ValidationError("health registry must contain an agents object")
+        if len(agents) > MAX_HEALTH_RECORDS:
+            raise ValidationError("health registry exceeds the maximum record count")
+        for agent_id, value in agents.items():
+            record = AgentHealthRecord.from_dict(value)
+            if agent_id != record.agent_id:
+                raise ValidationError("health registry key does not match record agent_id")
+        return health
+
+    def set_agent_health(self, record: AgentHealthRecord) -> AgentHealthRecord:
+        health = self._read_health()
+        agents = health["agents"]
+        if record.agent_id not in agents and len(agents) >= MAX_HEALTH_RECORDS:
+            raise ValidationError("health registry exceeds the maximum record count")
+        agents[record.agent_id] = record.to_dict()
+        self._atomic_write(self.health_path, health)
+        return record
+
+    def get_agent_health(self, agent_id: str) -> Optional[AgentHealthRecord]:
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValidationError("agent_id must be a non-empty string")
+        value = self._read_health()["agents"].get(agent_id)
+        return AgentHealthRecord.from_dict(value) if value is not None else None
+
+    def list_agent_health(self) -> List[AgentHealthRecord]:
+        health = self._read_health()
+        return [
+            AgentHealthRecord.from_dict(value)
+            for _, value in sorted(health["agents"].items())
+        ]
+
+    def clear_agent_health(self, agent_id: str) -> bool:
+        health = self._read_health()
+        if agent_id not in health["agents"]:
+            return False
+        del health["agents"][agent_id]
+        self._atomic_write(self.health_path, health)
+        return True
 
     def _task_path(self, task_id: str) -> Path:
         if not isinstance(task_id, str) or not task_id or not task_id.isalnum() or len(task_id) > 64:

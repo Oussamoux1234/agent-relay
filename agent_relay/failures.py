@@ -51,6 +51,7 @@ QUOTA_PATTERNS = _compile(
             r"\borganization_usage_limit_exceeded\b|\borganization usage limit reached\b",
         ),
         ("insufficient-quota", r"\binsufficient_quota\b"),
+        ("enforced-spend-limit", r"\benforced_spend_limit_reached\b"),
         ("quota-exhausted", r"\bquota_exhausted\b|\bquota (?:has been )?exceeded\b"),
         ("current-quota-exceeded", r"\bexceeded your current quota\b"),
         ("capacity-exhausted", r"\b(?:you have )?exhausted your capacity\b"),

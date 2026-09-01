@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional, Sequence
 
 from .adapters import AgentExecutionResult
 from .errors import RelayError
+from .health import AgentHealthRecord, utc_datetime_now
 from .models import AgentSpec
 from .presets import PRESETS, build_preset, list_preset_statuses
 from .service import HandoffOutcome, RelayService, ResultPreview, RouteOutcome
@@ -76,6 +77,7 @@ def _route_to_dict(outcome: RouteOutcome, include_prompt: bool) -> Dict[str, Any
         "revision": outcome.task.revision,
         "routing_order": list(outcome.task.routing_order),
         "candidates": list(outcome.candidates),
+        "skipped": [_health_to_dict(record) for record in outcome.skipped],
         "attempts": [
             {
                 "agent_id": attempt.agent_id,
@@ -96,6 +98,10 @@ def _route_to_dict(outcome: RouteOutcome, include_prompt: bool) -> Dict[str, Any
     if include_prompt:
         value["prompt"] = outcome.prompt
     return value
+
+
+def _health_to_dict(record: AgentHealthRecord, observed_at: Any = None) -> Dict[str, Any]:
+    return record.to_status_dict(observed_at or utc_datetime_now())
 
 
 def _result_preview_to_dict(preview: ResultPreview) -> Dict[str, Any]:
@@ -205,6 +211,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="include the last checkpoint prompt in executed route output",
     )
+    route_recover = route_commands.add_parser(
+        "recover",
+        help="explicitly move a task back to an earlier eligible route entry",
+    )
+    route_recover.add_argument("task_id")
+    route_recover.add_argument("target_agent")
 
     result = commands.add_parser("result", help="preview or accept structured agent results")
     result_commands = result.add_subparsers(dest="result_command", required=True)
@@ -221,6 +233,17 @@ def build_parser() -> argparse.ArgumentParser:
     result_accept.add_argument("task_id")
     result_accept.add_argument("source_action_id")
     result_accept.add_argument("--expected-revision", type=int, required=True)
+
+    health = commands.add_parser("health", help="inspect or clear provider cooldowns")
+    health_commands = health.add_subparsers(dest="health_command", required=True)
+    health_commands.add_parser("list", help="list persisted agent health records")
+    health_show = health_commands.add_parser("show", help="show one agent health record")
+    health_show.add_argument("agent_id")
+    health_clear = health_commands.add_parser(
+        "clear",
+        help="explicitly clear one agent cooldown",
+    )
+    health_clear.add_argument("agent_id")
 
     resolve = commands.add_parser("resolve", help="resolve an unknown handoff outcome")
     resolve.add_argument("task_id")
@@ -297,13 +320,18 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "routing_order": list(checkpoint.routing_order),
         }
     if args.command_name == "route" and args.route_command == "show":
-        checkpoint = service.store.get_task(args.task_id)
+        status = service.inspect_route(args.task_id)
+        checkpoint = status.task
         return {
             "task_id": checkpoint.task_id,
             "active_agent": checkpoint.active_agent,
             "task_status": checkpoint.status,
             "revision": checkpoint.revision,
             "routing_order": list(checkpoint.routing_order),
+            "candidates": list(status.candidates),
+            "skipped": [
+                _health_to_dict(record, status.observed_at) for record in status.skipped
+            ],
         }
     if args.command_name == "route" and args.route_command == "run":
         if args.execute:
@@ -311,6 +339,16 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             return _route_to_dict(outcome, include_prompt=args.show_prompt)
         outcome = service.preview_route(args.task_id)
         return _route_to_dict(outcome, include_prompt=True)
+    if args.command_name == "route" and args.route_command == "recover":
+        checkpoint = service.recover_route(args.task_id, args.target_agent)
+        return {
+            "task_id": checkpoint.task_id,
+            "active_agent": checkpoint.active_agent,
+            "task_status": checkpoint.status,
+            "revision": checkpoint.revision,
+            "routing_order": list(checkpoint.routing_order),
+            "recovery_action_id": checkpoint.actions[-1].action_id,
+        }
     if args.command_name == "result" and args.result_command == "preview":
         preview = service.preview_result(args.task_id, args.source_action_id)
         return _result_preview_to_dict(preview)
@@ -321,6 +359,17 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             args.expected_revision,
         )
         return {"task": checkpoint.to_dict()}
+    if args.command_name == "health" and args.health_command == "list":
+        return {
+            "health": [_health_to_dict(record) for record in service.list_agent_health()]
+        }
+    if args.command_name == "health" and args.health_command == "show":
+        return {"health": _health_to_dict(service.get_agent_health(args.agent_id))}
+    if args.command_name == "health" and args.health_command == "clear":
+        return {
+            "agent_id": args.agent_id,
+            "cleared": service.clear_agent_health(args.agent_id),
+        }
     if args.command_name == "resolve":
         checkpoint = service.resolve_action(args.task_id, args.action_id, args.resolution)
         return {"task": checkpoint.to_dict()}

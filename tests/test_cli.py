@@ -193,6 +193,62 @@ class CliTestCase(unittest.TestCase):
         self.assertEqual(accepted["state"]["summary"], "Fresh CLI summary")
         self.assertEqual(accepted["state"]["tests"], ["cli test passed"])
 
+    def test_cli_can_inspect_clear_and_recover_provider_health(self) -> None:
+        service = RelayService(RelayStore(Path(self.state_dir)))
+        for agent_id, provider_id, code in (
+            (
+                "codex-primary",
+                "codex-cli",
+                "import sys; sys.stderr.write("
+                "'{\"type\":\"rate_limit_error\",\"retry-after\":120}'); "
+                "raise SystemExit(1)",
+            ),
+            ("claude-backup", "claude-code", "print('backup')"),
+        ):
+            service.register_agent(
+                AgentSpec(
+                    agent_id=agent_id,
+                    display_name=agent_id,
+                    command=(sys.executable, "-c", code),
+                    capabilities=("repo-read",),
+                    provider_id=provider_id,
+                )
+            )
+        task = service.create_task(
+            "Health CLI",
+            "Recover explicitly",
+            active_agent="codex-primary",
+        )
+        service.configure_route(task.task_id, ["codex-primary", "claude-backup"])
+        service.run_route(task.task_id, self.root)
+
+        status, output, _ = self.invoke("health", "list")
+        self.assertEqual(status, 0)
+        health = json.loads(output)["health"]
+        self.assertEqual([record["agent_id"] for record in health], ["codex-primary"])
+        self.assertTrue(health[0]["active"])
+
+        status, output, _ = self.invoke("health", "show", "codex-primary")
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(output)["health"]["retry_source"], "provider_hint")
+
+        status, output, _ = self.invoke("health", "clear", "codex-primary")
+        self.assertEqual(status, 0)
+        self.assertTrue(json.loads(output)["cleared"])
+
+        status, output, _ = self.invoke(
+            "route",
+            "recover",
+            task.task_id,
+            "codex-primary",
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(output)["active_agent"], "codex-primary")
+
+        status, output, _ = self.invoke("health", "list")
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(output)["health"], [])
+
 
 if __name__ == "__main__":
     unittest.main()
