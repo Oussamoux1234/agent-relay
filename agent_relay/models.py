@@ -13,6 +13,7 @@ from .errors import ValidationError
 
 
 SCHEMA_VERSION = "1.0"
+RESULT_SCHEMA_VERSION = "1.0"
 AGENT_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 ADAPTER_TYPE_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -213,6 +214,127 @@ class TaskState:
             files_changed=value.get("files_changed", []),
             tests=value.get("tests", []),
             next_steps=value.get("next_steps", []),
+        )
+
+
+@dataclass(frozen=True)
+class StructuredAgentResult:
+    """Bounded, explicit facts proposed by one completed agent action."""
+
+    task_id: str
+    source_action_id: str
+    summary: str
+    decisions: Tuple[str, ...] = ()
+    constraints: Tuple[str, ...] = ()
+    files_changed: Tuple[str, ...] = ()
+    tests: Tuple[str, ...] = ()
+    next_steps: Tuple[str, ...] = ()
+    schema_version: str = RESULT_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.task_id, str)
+            or not self.task_id.isalnum()
+            or len(self.task_id) > 64
+        ):
+            raise ValidationError("result task_id must be an alphanumeric identifier")
+        normalized_action_id = _required_text(
+            self.source_action_id,
+            "result source_action_id",
+            max_length=64,
+        )
+        normalized_summary = _required_text(
+            self.summary,
+            "result summary",
+            max_length=20_000,
+        )
+        if self.schema_version != RESULT_SCHEMA_VERSION:
+            raise ValidationError("unsupported result schema_version")
+
+        normalized_lists = {}
+        for field_name in (
+            "decisions",
+            "constraints",
+            "files_changed",
+            "tests",
+            "next_steps",
+        ):
+            normalized_lists[field_name] = tuple(
+                _string_list(getattr(self, field_name), "result %s" % field_name, max_items=100)
+            )
+
+        try:
+            total_bytes = len(normalized_action_id.encode("utf-8"))
+            total_bytes += len(normalized_summary.encode("utf-8"))
+            for values in normalized_lists.values():
+                total_bytes += sum(len(value.encode("utf-8")) for value in values)
+        except UnicodeEncodeError as exc:
+            raise ValidationError("structured result contains invalid Unicode") from exc
+        if total_bytes > 60_000:
+            raise ValidationError("structured result exceeds the maximum content size")
+
+        object.__setattr__(self, "source_action_id", normalized_action_id)
+        object.__setattr__(self, "summary", normalized_summary)
+        for field_name, values in normalized_lists.items():
+            object.__setattr__(self, field_name, values)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "task_id": self.task_id,
+            "source_action_id": self.source_action_id,
+            "summary": self.summary,
+            "decisions": list(self.decisions),
+            "constraints": list(self.constraints),
+            "files_changed": list(self.files_changed),
+            "tests": list(self.tests),
+            "next_steps": list(self.next_steps),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Dict[str, Any]) -> "StructuredAgentResult":
+        if not isinstance(value, dict):
+            raise ValidationError("structured result must be an object")
+        if not all(isinstance(field_name, str) for field_name in value):
+            raise ValidationError("structured result field names must be strings")
+        allowed_fields = {
+            "schema_version",
+            "task_id",
+            "source_action_id",
+            "summary",
+            "decisions",
+            "constraints",
+            "files_changed",
+            "tests",
+            "next_steps",
+        }
+        unknown_fields = sorted(set(value).difference(allowed_fields))
+        if unknown_fields:
+            raise ValidationError(
+                "structured result contains unknown fields: %s" % ", ".join(unknown_fields)
+            )
+        list_fields = {}
+        for field_name in (
+            "decisions",
+            "constraints",
+            "files_changed",
+            "tests",
+            "next_steps",
+        ):
+            field_value = value.get(field_name, [])
+            if not isinstance(field_value, list):
+                raise ValidationError("structured result %s must be a list" % field_name)
+            list_fields[field_name] = tuple(field_value)
+        return cls(
+            schema_version=value.get("schema_version"),
+            task_id=value.get("task_id"),
+            source_action_id=value.get("source_action_id"),
+            summary=value.get("summary"),
+            decisions=list_fields["decisions"],
+            constraints=list_fields["constraints"],
+            files_changed=list_fields["files_changed"],
+            tests=list_fields["tests"],
+            next_steps=list_fields["next_steps"],
         )
 
 

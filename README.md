@@ -21,6 +21,8 @@ The MVP answers one question: **can a user register arbitrary agents and move a 
 - Configure an ordered route across Codex, Claude, Gemini, and Antigravity preset instances.
 - Continue to the next read-only agent after a documented quota/rate-limit signal or a process that could not start.
 - Fail closed on authentication, timeout, overload, and unrecognized routed failures.
+- Extract bounded structured-result proposals from successful routed agents.
+- Preview proposed memory changes and accept them only with an unchanged checkpoint revision.
 - Persist local state atomically with owner-only permissions where the filesystem supports them.
 
 Agent Relay does not claim to transfer a model's hidden reasoning or private session. It transfers an auditable set of facts about the task.
@@ -36,7 +38,8 @@ User ──> Relay service contract ──┼─ Claude Code adapter
               │
               ├─ versioned checkpoint
               ├─ ordered fallback policy
-              └─ action ledger + redacted failure class
+              ├─ structured-result proposal
+              └─ action ledger + redacted failure class/digest
 ```
 
 `AgentSpec` identifies the runtime type, and `AdapterRegistry` resolves it to an implementation. `CliAgentAdapter` launches a configured argv list with `shell=False`. Future API and application-extension adapters can be added without changing checkpoint persistence or handoff policy.
@@ -194,7 +197,37 @@ Relay invokes the active CLI agent first. If that process exits with a recognize
 
 The detector recognizes documented signals such as OpenAI 429/quota codes, Claude `rate_limit_error`, and Gemini `429 RESOURCE_EXHAUSTED`. Authentication or payment errors, timeouts, overloads, and unrecognized non-zero exits block the task instead of launching another process. These rules follow the official [OpenAI error-code guide](https://developers.openai.com/api/docs/guides/error-codes), [Claude API error reference](https://platform.claude.com/docs/en/api/errors), and [Gemini troubleshooting guide](https://ai.google.dev/gemini-api/docs/troubleshooting).
 
-Only classifications and execution metadata are persisted; raw stdout and stderr are returned to the invoking user but are not written into the task ledger. Automatic routing currently applies to Relay-launched CLI processes. It cannot observe a limit encountered inside an unrelated Codex App, Claude Code, or Antigravity session.
+Failure attempts persist only classifications and execution metadata. Successful attempts may persist a bounded, validated result proposal for review. Raw stdout and stderr are returned to the invoking user but are not written into the task ledger. Automatic routing currently applies to Relay-launched CLI processes. It cannot observe a limit encountered inside an unrelated Codex App, Claude Code, or Antigravity session.
+
+## Review and accept fresh agent memory
+
+Every executed route now asks the successful agent to finish with a marked JSON result envelope containing only these fields:
+
+- `summary`
+- `decisions`
+- `constraints`
+- `files_changed`
+- `tests`
+- `next_steps`
+
+The envelope is tied to the exact `task_id` and `source_action_id`. Relay understands plain output and the JSON response wrappers used by Codex, Claude, Gemini, and Antigravity. A valid proposal appears in the `route run --execute` response with `result_status: "pending"` and an `action_id`.
+
+Preview the exact state change without mutating the checkpoint:
+
+```bash
+python3 -m agent_relay result preview TASK_ID ACTION_ID
+```
+
+The preview returns `checkpoint_revision`, the proposed summary, and only the new list entries after de-duplication. Accept it only after review:
+
+```bash
+python3 -m agent_relay result accept TASK_ID ACTION_ID \
+  --expected-revision CHECKPOINT_REVISION
+```
+
+Acceptance fails if the checkpoint changed after preview, an unresolved action exists, or a later agent execution made the proposal stale. Missing markers, malformed JSON, unknown fields, wrong task/action IDs, ambiguous envelopes, and oversized content never modify task memory. Pending proposals are redacted from later agent prompts; after acceptance, the proposal is removed from the action details and replaced by a SHA-256 digest plus field counts.
+
+This is explicit, reviewable memory—not independent verification of an agent's claims. Relay does not automatically run reported tests or trust reported files. Provider response handling follows the official [Claude headless output](https://code.claude.com/docs/en/headless), [Gemini automation](https://geminicli.com/docs/cli/tutorials/automation/), and [Antigravity streaming JSON](https://antigravity.google/docs/cli/headless/) formats.
 
 ## Update the shared checkpoint
 
@@ -228,7 +261,7 @@ The GitHub Actions workflow runs the same suite on Python 3.9 through 3.14 with 
 - The adapter launches CLI processes but does not scrape or impersonate consumer subscriptions.
 - All built-in provider presets are read-only or plan-only; a workspace-write profile is not enabled yet.
 - Codex App task control is not implemented; the current Codex integration is CLI-based.
-- The checkpoint is updated through Relay commands; automatic diff and test harvesting is a follow-up.
+- Structured result fields are agent-reported and user-approved; automatic filesystem diff and test verification is not implemented yet.
 - Provider cooldown windows and automatic return to an earlier route entry are not implemented yet.
 - State is local JSON and optimized for one writer. A service deployment will need transactional storage and stronger concurrency control.
 - There is no HTTP API or graphical interface yet.
@@ -241,4 +274,4 @@ Agent Relay is licensed under the [Apache License 2.0](LICENSE).
 
 ## Next milestone
 
-[Harvest structured, verified agent results](https://github.com/Oussamoux1234/agent-relay/issues/4) back into the shared checkpoint so the next routed run starts with fresh summaries, files, and test evidence. After that, add provider cooldown/health state, Codex App integration, and explicitly approved workspace-write profiles as separate milestones.
+[Track provider cooldowns and route recovery](https://github.com/Oussamoux1234/agent-relay/issues/5) so recently limited agents are skipped until their documented retry window expires. Codex App integration and explicitly approved workspace-write profiles remain separate later milestones.

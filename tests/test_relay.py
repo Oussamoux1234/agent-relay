@@ -106,6 +106,7 @@ class RelayTestCase(unittest.TestCase):
 
         self.assertEqual(outcome.execution.status, "completed")
         self.assertIn("checkpoint-received=True", outcome.execution.stdout)
+        self.assertNotIn("result_contract", outcome.prompt)
         self.assertEqual(outcome.task.active_agent, "gemini-cli")
         self.assertEqual(outcome.task.actions[-1].status, "completed")
         self.assertEqual(outcome.task.revision, 3)

@@ -141,6 +141,58 @@ class CliTestCase(unittest.TestCase):
         self.assertEqual(preview["attempts"], [])
         self.assertIn("Keep the checkpoint portable", preview["prompt"])
 
+    def test_cli_can_preview_and_accept_a_structured_result(self) -> None:
+        result_code = (
+            "import json, sys; prompt = sys.stdin.read(); "
+            "payload = json.loads(prompt[prompt.index('{'):]); "
+            "contract = payload['handoff']['result_contract']; "
+            "result = dict(contract['schema']); "
+            "result['summary'] = 'Fresh CLI summary'; "
+            "result['tests'] = ['cli test passed']; "
+            "print(contract['begin_marker']); print(json.dumps(result)); "
+            "print(contract['end_marker'])"
+        )
+        service = RelayService(RelayStore(Path(self.state_dir)))
+        for agent_id, code in (
+            ("codex-primary", result_code),
+            ("codex-backup", "print('backup')"),
+        ):
+            service.register_agent(
+                AgentSpec(
+                    agent_id=agent_id,
+                    display_name=agent_id,
+                    command=(sys.executable, "-c", code),
+                    capabilities=("repo-read",),
+                    provider_id="codex-cli",
+                )
+            )
+        task = service.create_task(
+            "Result CLI",
+            "Accept explicit memory",
+            active_agent="codex-primary",
+        )
+        service.configure_route(task.task_id, ["codex-primary", "codex-backup"])
+        outcome = service.run_route(task.task_id, self.root)
+        action_id = outcome.attempts[0].action_id
+
+        status, output, _ = self.invoke("result", "preview", task.task_id, action_id)
+        self.assertEqual(status, 0)
+        preview = json.loads(output)
+        self.assertEqual(preview["changes"]["summary_after"], "Fresh CLI summary")
+
+        status, output, _ = self.invoke(
+            "result",
+            "accept",
+            task.task_id,
+            action_id,
+            "--expected-revision",
+            str(preview["checkpoint_revision"]),
+        )
+        self.assertEqual(status, 0)
+        accepted = json.loads(output)["task"]
+        self.assertEqual(accepted["state"]["summary"], "Fresh CLI summary")
+        self.assertEqual(accepted["state"]["tests"], ["cli test passed"])
+
 
 if __name__ == "__main__":
     unittest.main()

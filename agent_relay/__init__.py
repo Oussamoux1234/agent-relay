@@ -2,8 +2,9 @@
 
 from .adapters import AdapterRegistry, AntigravityCliAdapter
 from .failures import FailureClassification, FailureClassifier
-from .models import AgentSpec, TaskCheckpoint, TaskState
-from .service import RelayService, RouteAttempt, RouteOutcome
+from .models import AgentSpec, StructuredAgentResult, TaskCheckpoint, TaskState
+from .results import StructuredResultExtractor
+from .service import RelayService, ResultPreview, RouteAttempt, RouteOutcome
 from .storage import RelayStore
 
 __all__ = [
@@ -14,9 +15,12 @@ __all__ = [
     "FailureClassifier",
     "RelayService",
     "RelayStore",
+    "ResultPreview",
     "RouteAttempt",
     "RouteOutcome",
+    "StructuredAgentResult",
+    "StructuredResultExtractor",
     "TaskCheckpoint",
     "TaskState",
 ]
-__version__ = "0.3.0"
+__version__ = "0.4.0"

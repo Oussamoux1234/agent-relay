@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .adapters import (
     AdapterRegistry,
@@ -15,8 +15,16 @@ from .adapters import (
 )
 from .errors import ConflictError, NotFoundError, ValidationError
 from .failures import FailureClassification, FailureClassifier
-from .models import ActionRecord, AgentSpec, TaskCheckpoint, utc_now
+from .models import (
+    ActionRecord,
+    AgentSpec,
+    StructuredAgentResult,
+    TaskCheckpoint,
+    TaskState,
+    utc_now,
+)
 from .prompting import CheckpointPromptRenderer
+from .results import ResultExtraction, StructuredResultExtractor, result_digest
 from .storage import RelayStore
 
 
@@ -39,6 +47,9 @@ class RouteAttempt:
     action_id: str
     classification: FailureClassification
     execution: AgentExecutionResult
+    result_status: str = "not-applicable"
+    result: Optional[StructuredAgentResult] = None
+    result_error_code: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +61,17 @@ class RouteOutcome:
     attempts: Tuple[RouteAttempt, ...]
     prompt: str
     dry_run: bool
+
+
+@dataclass(frozen=True)
+class ResultPreview:
+    """Read-only view of one pending structured checkpoint proposal."""
+
+    task: TaskCheckpoint
+    source_action_id: str
+    source_agent: str
+    proposal: StructuredAgentResult
+    changes: Dict[str, Any]
 
 
 AUTO_ROUTE_PROVIDER_IDS = frozenset(
@@ -67,6 +89,7 @@ class RelayService:
         renderer: Optional[CheckpointPromptRenderer] = None,
         adapter_registry: Optional[AdapterRegistry] = None,
         classifier: Optional[FailureClassifier] = None,
+        result_extractor: Optional[StructuredResultExtractor] = None,
     ) -> None:
         self.store = store
         if adapter is not None and adapter_registry is not None:
@@ -81,6 +104,7 @@ class RelayService:
             self.adapter = None
         self.renderer = renderer or CheckpointPromptRenderer()
         self.classifier = classifier or FailureClassifier()
+        self.result_extractor = result_extractor or StructuredResultExtractor()
 
     def register_agent(self, spec: AgentSpec, replace: bool = False) -> AgentSpec:
         self.adapters.get(spec.adapter_type)
@@ -281,6 +305,13 @@ class RelayService:
 
             execution = runtime_adapter.execute(target, last_prompt, resolved_directory)
             classification = self.classifier.classify(target, execution)
+            extraction = ResultExtraction("not-applicable")
+            if execution.status == "completed":
+                extraction = self.result_extractor.extract(
+                    execution.stdout,
+                    task_id,
+                    action.action_id,
+                )
 
             checkpoint = self.store.get_task(task_id)
             expected_revision = checkpoint.revision
@@ -297,6 +328,22 @@ class RelayService:
                     "timed_out": execution.timed_out,
                 }
             )
+            if execution.status == "completed":
+                if extraction.status == "ready" and extraction.result is not None:
+                    persisted_action.details.update(
+                        {
+                            "result_status": "pending",
+                            "result_digest": result_digest(extraction.result),
+                            "result_proposal": extraction.result.to_dict(),
+                        }
+                    )
+                else:
+                    persisted_action.details.update(
+                        {
+                            "result_status": extraction.status,
+                            "result_error_code": extraction.error_code,
+                        }
+                    )
 
             has_next = position + 1 < len(candidates)
             if execution.status == "completed":
@@ -317,6 +364,11 @@ class RelayService:
                     action_id=action.action_id,
                     classification=classification,
                     execution=execution,
+                    result_status=(
+                        "pending" if extraction.status == "ready" else extraction.status
+                    ),
+                    result=extraction.result,
+                    result_error_code=extraction.error_code,
                 )
             )
             if execution.status == "completed" or not classification.safe_to_fallback or not has_next:
@@ -329,6 +381,96 @@ class RelayService:
                 )
 
         raise AssertionError("configured route contained no candidates")
+
+    def preview_result(self, task_id: str, source_action_id: str) -> ResultPreview:
+        checkpoint = self.store.get_task(task_id)
+        source_action, proposal = self._pending_result(checkpoint, source_action_id)
+        return self._build_result_preview(checkpoint, source_action, proposal)
+
+    def accept_result(
+        self,
+        task_id: str,
+        source_action_id: str,
+        expected_revision: int,
+    ) -> TaskCheckpoint:
+        """Apply a previewed result if the checkpoint has not changed since preview."""
+
+        checkpoint = self.store.get_task(task_id)
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 1
+        ):
+            raise ValidationError("expected_revision must be a positive integer")
+        if checkpoint.revision != expected_revision:
+            raise ConflictError(
+                "checkpoint changed after result preview: expected revision %d, found %d"
+                % (expected_revision, checkpoint.revision)
+            )
+        if checkpoint.status == "completed":
+            raise ConflictError("completed tasks cannot accept result proposals")
+        unresolved = checkpoint.unresolved_actions()
+        if unresolved:
+            raise ConflictError(
+                "task has an unresolved action (%s); resolve it before accepting a result"
+                % unresolved[0].action_id
+            )
+
+        source_action, proposal = self._pending_result(checkpoint, source_action_id)
+        source_index = checkpoint.actions.index(source_action)
+        later_executions = [
+            action
+            for action in checkpoint.actions[source_index + 1 :]
+            if action.kind in {"handoff", "route-run"}
+        ]
+        if later_executions:
+            raise ConflictError("result proposal is stale because a later agent action exists")
+
+        preview = self._build_result_preview(checkpoint, source_action, proposal)
+        checkpoint.state.summary = proposal.summary
+        additions = preview.changes["additions"]
+        for field_name in (
+            "decisions",
+            "constraints",
+            "files_changed",
+            "tests",
+            "next_steps",
+        ):
+            getattr(checkpoint.state, field_name).extend(additions[field_name])
+        checkpoint.state.__post_init__()
+
+        accepted_at = utc_now()
+        acceptance_action_id = uuid.uuid4().hex
+        digest = result_digest(proposal)
+        source_action.details.pop("result_proposal", None)
+        source_action.details.update(
+            {
+                "result_status": "accepted",
+                "result_digest": digest,
+                "result_accepted_action_id": acceptance_action_id,
+            }
+        )
+        checkpoint.actions.append(
+            ActionRecord(
+                action_id=acceptance_action_id,
+                kind="result-accept",
+                agent_id=source_action.agent_id,
+                status="completed",
+                started_at=accepted_at,
+                finished_at=accepted_at,
+                details={
+                    "source_action_id": source_action.action_id,
+                    "source_agent": source_action.agent_id,
+                    "proposal_digest": digest,
+                    "summary_changed": preview.changes["summary_changed"],
+                    "applied_counts": {
+                        field_name: len(values) for field_name, values in additions.items()
+                    },
+                },
+            )
+        )
+        checkpoint.__post_init__()
+        return self.store.save_task(checkpoint, expected_revision)
 
     def resolve_action(self, task_id: str, action_id: str, resolution: str) -> TaskCheckpoint:
         if resolution not in {"completed", "failed", "cancelled"}:
@@ -390,6 +532,71 @@ class RelayService:
                 "automatic routing is limited to repo-read agent presets: %s" % agent_id
             )
         return spec
+
+    @staticmethod
+    def _pending_result(
+        checkpoint: TaskCheckpoint,
+        source_action_id: str,
+    ) -> Tuple[ActionRecord, StructuredAgentResult]:
+        source_action = RelayService._find_action(checkpoint, source_action_id)
+        if source_action.kind != "route-run" or source_action.status != "completed":
+            raise ConflictError("result proposals require a completed route-run action")
+        result_status = source_action.details.get("result_status")
+        if result_status != "pending":
+            raise ConflictError("action has no pending result proposal")
+        proposal_value = source_action.details.get("result_proposal")
+        if not isinstance(proposal_value, dict):
+            raise ValidationError("pending result proposal is missing or invalid")
+        proposal = StructuredAgentResult.from_dict(proposal_value)
+        if (
+            proposal.task_id != checkpoint.task_id
+            or proposal.source_action_id != source_action.action_id
+        ):
+            raise ValidationError("pending result proposal does not match its source action")
+        return source_action, proposal
+
+    @staticmethod
+    def _build_result_preview(
+        checkpoint: TaskCheckpoint,
+        source_action: ActionRecord,
+        proposal: StructuredAgentResult,
+    ) -> ResultPreview:
+        additions = {}
+        for field_name in (
+            "decisions",
+            "constraints",
+            "files_changed",
+            "tests",
+            "next_steps",
+        ):
+            seen = set(getattr(checkpoint.state, field_name))
+            field_additions = []
+            for value in getattr(proposal, field_name):
+                if value not in seen:
+                    field_additions.append(value)
+                    seen.add(value)
+            additions[field_name] = field_additions
+        changes = {
+            "summary_changed": checkpoint.state.summary != proposal.summary,
+            "summary_before": checkpoint.state.summary,
+            "summary_after": proposal.summary,
+            "additions": additions,
+        }
+        TaskState(
+            summary=proposal.summary,
+            decisions=checkpoint.state.decisions + additions["decisions"],
+            constraints=checkpoint.state.constraints + additions["constraints"],
+            files_changed=checkpoint.state.files_changed + additions["files_changed"],
+            tests=checkpoint.state.tests + additions["tests"],
+            next_steps=checkpoint.state.next_steps + additions["next_steps"],
+        )
+        return ResultPreview(
+            task=checkpoint,
+            source_action_id=source_action.action_id,
+            source_agent=source_action.agent_id,
+            proposal=proposal,
+            changes=changes,
+        )
 
     @staticmethod
     def _find_action(checkpoint: TaskCheckpoint, action_id: str) -> ActionRecord:

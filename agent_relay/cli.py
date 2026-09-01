@@ -13,7 +13,7 @@ from .adapters import AgentExecutionResult
 from .errors import RelayError
 from .models import AgentSpec
 from .presets import PRESETS, build_preset, list_preset_statuses
-from .service import HandoffOutcome, RelayService, RouteOutcome
+from .service import HandoffOutcome, RelayService, ResultPreview, RouteOutcome
 from .storage import RelayStore
 
 
@@ -84,6 +84,11 @@ def _route_to_dict(outcome: RouteOutcome, include_prompt: bool) -> Dict[str, Any
                 "evidence_code": attempt.classification.evidence_code,
                 "safe_to_fallback": attempt.classification.safe_to_fallback,
                 "execution": _execution_to_dict(attempt.execution),
+                "result_status": attempt.result_status,
+                "result_error_code": attempt.result_error_code,
+                "result_proposal": (
+                    attempt.result.to_dict() if attempt.result is not None else None
+                ),
             }
             for attempt in outcome.attempts
         ],
@@ -91,6 +96,17 @@ def _route_to_dict(outcome: RouteOutcome, include_prompt: bool) -> Dict[str, Any
     if include_prompt:
         value["prompt"] = outcome.prompt
     return value
+
+
+def _result_preview_to_dict(preview: ResultPreview) -> Dict[str, Any]:
+    return {
+        "task_id": preview.task.task_id,
+        "checkpoint_revision": preview.task.revision,
+        "source_action_id": preview.source_action_id,
+        "source_agent": preview.source_agent,
+        "proposal": preview.proposal.to_dict(),
+        "changes": preview.changes,
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -190,6 +206,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="include the last checkpoint prompt in executed route output",
     )
 
+    result = commands.add_parser("result", help="preview or accept structured agent results")
+    result_commands = result.add_subparsers(dest="result_command", required=True)
+    result_preview = result_commands.add_parser(
+        "preview",
+        help="preview one pending result proposal without changing the checkpoint",
+    )
+    result_preview.add_argument("task_id")
+    result_preview.add_argument("source_action_id")
+    result_accept = result_commands.add_parser(
+        "accept",
+        help="accept a previewed result if the checkpoint revision still matches",
+    )
+    result_accept.add_argument("task_id")
+    result_accept.add_argument("source_action_id")
+    result_accept.add_argument("--expected-revision", type=int, required=True)
+
     resolve = commands.add_parser("resolve", help="resolve an unknown handoff outcome")
     resolve.add_argument("task_id")
     resolve.add_argument("action_id")
@@ -279,6 +311,16 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             return _route_to_dict(outcome, include_prompt=args.show_prompt)
         outcome = service.preview_route(args.task_id)
         return _route_to_dict(outcome, include_prompt=True)
+    if args.command_name == "result" and args.result_command == "preview":
+        preview = service.preview_result(args.task_id, args.source_action_id)
+        return _result_preview_to_dict(preview)
+    if args.command_name == "result" and args.result_command == "accept":
+        checkpoint = service.accept_result(
+            args.task_id,
+            args.source_action_id,
+            args.expected_revision,
+        )
+        return {"task": checkpoint.to_dict()}
     if args.command_name == "resolve":
         checkpoint = service.resolve_action(args.task_id, args.action_id, args.resolution)
         return {"task": checkpoint.to_dict()}
