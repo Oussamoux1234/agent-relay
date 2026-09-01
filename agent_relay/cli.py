@@ -1,0 +1,227 @@
+"""Command-line interface for registering agents and moving checkpoints."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any, Dict, Optional, Sequence
+
+from .errors import RelayError
+from .models import AgentSpec
+from .presets import PRESETS, build_preset, list_preset_statuses
+from .service import HandoffOutcome, RelayService
+from .storage import RelayStore
+
+
+def _default_state_dir() -> str:
+    return os.environ.get("AGENT_RELAY_STATE_DIR", ".agent-relay")
+
+
+def _print_json(value: Any, stream: Any = None) -> None:
+    if stream is None:
+        stream = sys.stdout
+    json.dump(value, stream, indent=2, sort_keys=True, ensure_ascii=False)
+    stream.write("\n")
+
+
+def _service(state_dir: str) -> RelayService:
+    return RelayService(RelayStore(Path(state_dir)))
+
+
+def _agent_to_public_dict(spec: AgentSpec) -> Dict[str, Any]:
+    value = spec.to_dict()
+    # Credential values are never persisted. An optional provider config-directory path is public.
+    return value
+
+
+def _handoff_to_dict(outcome: HandoffOutcome, include_prompt: bool) -> Dict[str, Any]:
+    value: Dict[str, Any] = {
+        "dry_run": outcome.dry_run,
+        "task_id": outcome.task.task_id,
+        "task_status": outcome.task.status,
+        "active_agent": outcome.task.active_agent,
+        "revision": outcome.task.revision,
+        "action_id": outcome.action_id,
+    }
+    if include_prompt:
+        value["prompt"] = outcome.prompt
+    if outcome.execution is not None:
+        value["execution"] = {
+            "status": outcome.execution.status,
+            "return_code": outcome.execution.return_code,
+            "elapsed_ms": outcome.execution.elapsed_ms,
+            "started": outcome.execution.started,
+            "timed_out": outcome.execution.timed_out,
+            "error": outcome.execution.error,
+            "stdout": outcome.execution.stdout,
+            "stderr": outcome.execution.stderr,
+        }
+    return value
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="agent-relay",
+        description="Carry explicit task checkpoints between user-owned AI agents.",
+    )
+    parser.add_argument(
+        "--state-dir",
+        default=_default_state_dir(),
+        help="local state directory (default: .agent-relay)",
+    )
+    commands = parser.add_subparsers(dest="command_name", required=True)
+
+    agent = commands.add_parser("agent", help="manage agent adapters")
+    agent_commands = agent.add_subparsers(dest="agent_command", required=True)
+    agent_add = agent_commands.add_parser("add", help="register a CLI agent")
+    agent_add.add_argument("agent_id")
+    agent_add.add_argument("--name", required=True)
+    agent_add.add_argument("--transport", choices=("stdin", "argument"), default="stdin")
+    agent_add.add_argument("--timeout", type=int, default=900)
+    agent_add.add_argument("--capability", action="append", default=[])
+    agent_add.add_argument("--allow-env", action="append", default=[])
+    agent_add.add_argument("--replace", action="store_true")
+    agent_add.add_argument("--command", required=True, help="agent executable")
+    agent_add.add_argument(
+        "--arg",
+        action="append",
+        default=[],
+        help="one fixed argv item; repeat as needed and use --arg=-x for values starting with -",
+    )
+    agent_commands.add_parser("list", help="list registered agents")
+    agent_commands.add_parser("presets", help="show built-in presets and local availability")
+    agent_add_preset = agent_commands.add_parser(
+        "add-preset",
+        help="register a reviewed built-in agent preset",
+    )
+    agent_add_preset.add_argument("preset_id", choices=tuple(sorted(PRESETS)))
+    agent_add_preset.add_argument("--id", dest="agent_id")
+    agent_add_preset.add_argument("--executable")
+    agent_add_preset.add_argument(
+        "--config-home",
+        help="absolute provider config directory for an isolated Codex or Claude instance",
+    )
+    agent_add_preset.add_argument("--timeout", type=int, default=900)
+    agent_add_preset.add_argument("--replace", action="store_true")
+
+    task = commands.add_parser("task", help="manage portable task checkpoints")
+    task_commands = task.add_subparsers(dest="task_command", required=True)
+    task_create = task_commands.add_parser("create", help="create a checkpoint")
+    task_create.add_argument("--title", required=True)
+    task_create.add_argument("--goal", required=True)
+    task_create.add_argument("--agent")
+    task_create.add_argument("--summary", default="Not started")
+    task_show = task_commands.add_parser("show", help="show one checkpoint")
+    task_show.add_argument("task_id")
+    task_commands.add_parser("list", help="list checkpoints")
+    task_note = task_commands.add_parser("note", help="append verified checkpoint facts")
+    task_note.add_argument("task_id")
+    task_note.add_argument("--summary")
+    task_note.add_argument("--decision", action="append", default=[])
+    task_note.add_argument("--constraint", action="append", default=[])
+    task_note.add_argument("--file", action="append", default=[])
+    task_note.add_argument("--test", action="append", default=[])
+    task_note.add_argument("--next", action="append", default=[])
+
+    handoff = commands.add_parser("handoff", help="preview or execute a task handoff")
+    handoff.add_argument("task_id")
+    handoff.add_argument("target_agent")
+    handoff.add_argument("--execute", action="store_true")
+    handoff.add_argument("--cwd", default=".")
+    handoff.add_argument(
+        "--show-prompt",
+        action="store_true",
+        help="include the full checkpoint prompt in executed handoff output",
+    )
+
+    resolve = commands.add_parser("resolve", help="resolve an unknown handoff outcome")
+    resolve.add_argument("task_id")
+    resolve.add_argument("action_id")
+    resolve.add_argument("--as", dest="resolution", choices=("completed", "failed", "cancelled"), required=True)
+    return parser
+
+
+def run(args: argparse.Namespace) -> Dict[str, Any]:
+    service = _service(args.state_dir)
+    if args.command_name == "agent" and args.agent_command == "add":
+        spec = AgentSpec(
+            agent_id=args.agent_id,
+            display_name=args.name,
+            command=tuple([args.command] + args.arg),
+            prompt_transport=args.transport,
+            timeout_seconds=args.timeout,
+            capabilities=tuple(args.capability),
+            env_allowlist=tuple(args.allow_env),
+        )
+        return {"agent": _agent_to_public_dict(service.register_agent(spec, replace=args.replace))}
+    if args.command_name == "agent" and args.agent_command == "list":
+        return {"agents": [_agent_to_public_dict(spec) for spec in service.store.list_agents()]}
+    if args.command_name == "agent" and args.agent_command == "presets":
+        return {"presets": list(list_preset_statuses())}
+    if args.command_name == "agent" and args.agent_command == "add-preset":
+        spec = build_preset(
+            preset_id=args.preset_id,
+            agent_id=args.agent_id,
+            executable=args.executable,
+            timeout_seconds=args.timeout,
+            config_home=args.config_home,
+        )
+        return {"agent": _agent_to_public_dict(service.register_agent(spec, replace=args.replace))}
+    if args.command_name == "task" and args.task_command == "create":
+        checkpoint = service.create_task(
+            title=args.title,
+            goal=args.goal,
+            active_agent=args.agent,
+            summary=args.summary,
+        )
+        return {"task": checkpoint.to_dict()}
+    if args.command_name == "task" and args.task_command == "show":
+        return {"task": service.store.get_task(args.task_id).to_dict()}
+    if args.command_name == "task" and args.task_command == "list":
+        return {"tasks": [checkpoint.to_dict() for checkpoint in service.store.list_tasks()]}
+    if args.command_name == "task" and args.task_command == "note":
+        checkpoint = service.add_task_notes(
+            task_id=args.task_id,
+            summary=args.summary,
+            decisions=args.decision,
+            constraints=args.constraint,
+            files_changed=args.file,
+            tests=args.test,
+            next_steps=args.next,
+        )
+        return {"task": checkpoint.to_dict()}
+    if args.command_name == "handoff":
+        if args.execute:
+            outcome = service.handoff(
+                task_id=args.task_id,
+                target_agent=args.target_agent,
+                working_directory=Path(args.cwd),
+            )
+            return _handoff_to_dict(outcome, include_prompt=args.show_prompt)
+        outcome = service.preview_handoff(args.task_id, args.target_agent)
+        return _handoff_to_dict(outcome, include_prompt=True)
+    if args.command_name == "resolve":
+        checkpoint = service.resolve_action(args.task_id, args.action_id, args.resolution)
+        return {"task": checkpoint.to_dict()}
+    raise AssertionError("unhandled command")
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        _print_json(run(args))
+        return 0
+    except RelayError as exc:
+        _print_json({"error": str(exc), "error_type": type(exc).__name__}, stream=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        _print_json({"error": "interrupted", "error_type": "KeyboardInterrupt"}, stream=sys.stderr)
+        return 130
+
+
+def entrypoint() -> None:
+    raise SystemExit(main())

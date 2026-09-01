@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-relay"
+version = "0.2.0"
+description = "Portable checkpoints and safe handoffs between user-owned AI coding agents"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+authors = [{name = "Agent Relay contributors"}]
+dependencies = []
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+
+[project.urls]
+Homepage = "https://github.com/Oussamoux1234/agent-relay"
+Issues = "https://github.com/Oussamoux1234/agent-relay/issues"
+
+[project.scripts]
+agent-relay = "agent_relay.cli:entrypoint"
+
+[tool.setuptools.packages.find]
+include = ["agent_relay*"]
