@@ -35,7 +35,13 @@ from .models import (
 from .prompting import CheckpointPromptRenderer
 from .results import ResultExtraction, StructuredResultExtractor, result_digest
 from .storage import RelayStore
-from .workspace import WorkspaceInspector, WorkspaceReview
+from .workspace import (
+    LEGACY_WORKSPACE_SNAPSHOT_VERSION,
+    WORKSPACE_SNAPSHOT_VERSION,
+    WorkspaceInspector,
+    WorkspaceReview,
+    WorkspaceSnapshot,
+)
 
 
 @dataclass(frozen=True)
@@ -351,6 +357,7 @@ class RelayService:
                 "before_head": before_snapshot.head,
                 "before_branch": before_snapshot.branch,
                 "preexisting_paths": list(before_snapshot.dirty_paths),
+                "snapshot_version": before_snapshot.snapshot_version,
             }
         checkpoint = self.store.save_task(checkpoint, expected_revision)
 
@@ -865,7 +872,7 @@ class RelayService:
             review.workspace_root,
         )
         current = self.workspace_inspector.snapshot(root)
-        if current.digest != review.after_digest:
+        if not self._workspace_digest_matches(review, current, review.after_digest):
             raise ConflictError(
                 "workspace changed after the recorded review; run the write or review flow again"
             )
@@ -911,7 +918,7 @@ class RelayService:
             review.workspace_root,
         )
         current = self.workspace_inspector.snapshot(root)
-        if current.digest != review.before_digest:
+        if not self._workspace_digest_matches(review, current, review.before_digest):
             raise ConflictError(
                 "workspace does not match the pre-run snapshot; follow rollback guidance and retry"
             )
@@ -1144,6 +1151,25 @@ class RelayService:
         if not isinstance(review_value, dict):
             raise ConflictError("workspace-write action has no recorded review")
         return source_action, WorkspaceReview.from_dict(review_value)
+
+    @staticmethod
+    def _workspace_digest_matches(
+        review: WorkspaceReview,
+        current: WorkspaceSnapshot,
+        expected_digest: str,
+    ) -> bool:
+        """Match current or safely comparable legacy workspace digests."""
+
+        if review.snapshot_version == WORKSPACE_SNAPSHOT_VERSION:
+            return current.digest == expected_digest
+        if review.snapshot_version == LEGACY_WORKSPACE_SNAPSHOT_VERSION:
+            if any(file_state.staged for file_state in current.files.values()):
+                raise ConflictError(
+                    "legacy workspace reviews with staged paths cannot be verified safely; "
+                    "restore the index with Agent Relay 0.7.0 before upgrading"
+                )
+            return current.legacy_digest == expected_digest
+        raise ValidationError("workspace review snapshot_version is unsupported")
 
     @staticmethod
     def _pending_workspace_reviews(

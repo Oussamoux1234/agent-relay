@@ -217,7 +217,9 @@ python3 -m agent_relay handoff TASK_ID codex-writer \
   --execute --cwd /absolute/path/to/repository
 ```
 
-Relay records a bounded snapshot before launch and another after the process returns. The review contains SHA-256 state digests, HEAD and branch changes, pre-existing dirty paths, introduced/modified/removed paths, and final dirty paths. Tracked, staged, untracked, and ignored paths are covered; file contents and raw diffs are never copied into Relay state. Inspection is limited to 2,000 relevant paths, 128 MiB per file, and 512 MiB total so an unbounded repository fails before execution or blocks safely after execution.
+Relay records a bounded snapshot before launch and another after the process returns. The review contains SHA-256 state digests, HEAD and branch changes, pre-existing dirty paths, introduced/modified/removed paths, and final dirty paths. Tracked, staged, untracked, and ignored paths are covered; snapshot format v2 hashes the mode, object ID, and conflict stage of each relevant Git index entry separately from the working-tree file. Repositories containing `assume-unchanged` or `skip-worktree` entries fail closed because those flags can hide edits from Git status. File contents, staged blobs, and raw diffs are never copied into Relay state. Inspection is limited to 2,000 relevant paths, 128 MiB per file, 512 MiB total, and 2 MiB per Git command output so an unbounded repository fails before execution or blocks safely after execution.
+
+Workspace reviews written before v0.7.1 remain readable. Relay can verify an old snapshot only when its current state has no staged paths; legacy reviews involving staged content fail closed and should be resolved with v0.7.0 before upgrading. New reviews record their snapshot version explicitly.
 
 If a successful run changed the snapshot, the task stays blocked. Ask Relay for the review metadata, then inspect the actual repository diff with Git:
 

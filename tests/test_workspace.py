@@ -109,6 +109,43 @@ class WorkspaceTestCase(unittest.TestCase):
         self.assertEqual(review.modified_paths, ("tracked.txt",))
         self.assertTrue(before.files["tracked.txt"].staged)
 
+    def test_staged_blob_changes_alter_the_hardened_snapshot_digest(self) -> None:
+        tracked = self.workspace / "tracked.txt"
+        tracked.write_text("staged-a\n", encoding="utf-8")
+        self.git("add", "tracked.txt")
+        tracked.write_text("same-worktree\n", encoding="utf-8")
+        before = self.inspector.snapshot(self.workspace)
+
+        tracked.write_text("staged-b\n", encoding="utf-8")
+        self.git("add", "tracked.txt")
+        tracked.write_text("same-worktree\n", encoding="utf-8")
+        after = self.inspector.snapshot(self.workspace)
+
+        review = self.inspector.compare(before, after)
+
+        self.assertEqual(before.legacy_digest, after.legacy_digest)
+        self.assertNotEqual(before.digest, after.digest)
+        self.assertNotEqual(
+            before.files["tracked.txt"].index_digest,
+            after.files["tracked.txt"].index_digest,
+        )
+        self.assertEqual(before.files["tracked.txt"].index_entry_count, 1)
+        self.assertEqual(review.status, "pending")
+        self.assertEqual(review.modified_paths, ("tracked.txt",))
+        self.assertEqual(review.snapshot_version, "2")
+
+    def test_assume_unchanged_paths_fail_closed_before_snapshot(self) -> None:
+        self.git("update-index", "--assume-unchanged", "tracked.txt")
+
+        with self.assertRaisesRegex(ValidationError, "assume-unchanged"):
+            self.inspector.snapshot(self.workspace)
+
+    def test_skip_worktree_paths_fail_closed_before_snapshot(self) -> None:
+        self.git("update-index", "--skip-worktree", "tracked.txt")
+
+        with self.assertRaisesRegex(ValidationError, "skip-worktree"):
+            self.inspector.snapshot(self.workspace)
+
     def test_ignored_file_changes_are_included_in_review(self) -> None:
         (self.workspace / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
         self.git("add", ".gitignore")
@@ -140,6 +177,54 @@ class WorkspaceTestCase(unittest.TestCase):
                     "after_branch": "main",
                     "introduced_paths": ["../escape"],
                 }
+            )
+
+    def test_review_without_snapshot_version_loads_as_legacy(self) -> None:
+        review = WorkspaceReview.from_dict(
+            {
+                "status": "clean",
+                "workspace_root": str(self.workspace),
+                "before_digest": "a" * 64,
+                "after_digest": "a" * 64,
+                "before_head": "b" * 40,
+                "after_head": "b" * 40,
+                "before_branch": "main",
+                "after_branch": "main",
+            }
+        )
+
+        self.assertEqual(review.snapshot_version, "1")
+
+    def test_legacy_digest_matching_fails_closed_when_index_is_staged(self) -> None:
+        clean = self.inspector.snapshot(self.workspace)
+        legacy_review = WorkspaceReview(
+            status="clean",
+            workspace_root=str(self.workspace),
+            before_digest=clean.legacy_digest,
+            after_digest=clean.legacy_digest,
+            before_head=clean.head,
+            after_head=clean.head,
+            before_branch=clean.branch,
+            after_branch=clean.branch,
+            snapshot_version="1",
+        )
+
+        self.assertTrue(
+            RelayService._workspace_digest_matches(
+                legacy_review,
+                clean,
+                clean.legacy_digest,
+            )
+        )
+
+        (self.workspace / "tracked.txt").write_text("staged\n", encoding="utf-8")
+        self.git("add", "tracked.txt")
+        staged = self.inspector.snapshot(self.workspace)
+        with self.assertRaisesRegex(ConflictError, "legacy workspace reviews"):
+            RelayService._workspace_digest_matches(
+                legacy_review,
+                staged,
+                staged.legacy_digest,
             )
 
 

@@ -20,6 +20,11 @@ MAX_WORKSPACE_PATHS = 2_000
 MAX_HASHED_FILE_BYTES = 128 * 1024 * 1024
 MAX_HASHED_TOTAL_BYTES = 512 * 1024 * 1024
 GIT_TIMEOUT_SECONDS = 15
+WORKSPACE_SNAPSHOT_VERSION = "2"
+LEGACY_WORKSPACE_SNAPSHOT_VERSION = "1"
+SUPPORTED_WORKSPACE_SNAPSHOT_VERSIONS = frozenset(
+    (LEGACY_WORKSPACE_SNAPSHOT_VERSION, WORKSPACE_SNAPSHOT_VERSION)
+)
 REVIEW_STATUSES = frozenset(("pending", "accepted", "rolled-back", "clean", "unavailable"))
 ROLLBACK_GUIDANCE = (
     "Inspect git status, unstaged diff, staged diff, and recent commits before deciding.",
@@ -39,6 +44,8 @@ class WorkspaceFileState:
     digest: str
     tracked: bool
     staged: bool
+    index_digest: str = ""
+    index_entry_count: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -48,6 +55,36 @@ class WorkspaceFileState:
             "digest": self.digest,
             "tracked": self.tracked,
             "staged": self.staged,
+            "index_digest": self.index_digest,
+            "index_entry_count": self.index_entry_count,
+        }
+
+    def to_legacy_dict(self) -> Dict[str, Any]:
+        """Return the v1 representation used to validate safe legacy reviews."""
+
+        return {
+            "kind": self.kind,
+            "size": self.size,
+            "mode": self.mode,
+            "digest": self.digest,
+            "tracked": self.tracked,
+            "staged": self.staged,
+        }
+
+
+@dataclass(frozen=True)
+class WorkspaceIndexEntry:
+    """Content-free identity for one path and stage in the Git index."""
+
+    mode: str
+    object_id: str
+    stage: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "object_id": self.object_id,
+            "stage": self.stage,
         }
 
 
@@ -60,6 +97,8 @@ class WorkspaceSnapshot:
     branch: Optional[str]
     files: Dict[str, WorkspaceFileState]
     digest: str
+    legacy_digest: str
+    snapshot_version: str = WORKSPACE_SNAPSHOT_VERSION
 
     @property
     def dirty_paths(self) -> Tuple[str, ...]:
@@ -85,10 +124,13 @@ class WorkspaceReview:
     final_dirty_paths: Tuple[str, ...] = ()
     error_code: Optional[str] = None
     reviewed_at: Optional[str] = None
+    snapshot_version: str = WORKSPACE_SNAPSHOT_VERSION
 
     def __post_init__(self) -> None:
         if self.status not in REVIEW_STATUSES:
             raise ValidationError("workspace review status is invalid")
+        if self.snapshot_version not in SUPPORTED_WORKSPACE_SNAPSHOT_VERSIONS:
+            raise ValidationError("workspace review snapshot_version is invalid")
         if (
             not isinstance(self.workspace_root, str)
             or len(self.workspace_root) > 4_096
@@ -200,6 +242,7 @@ class WorkspaceReview:
             "final_dirty_paths": list(self.final_dirty_paths),
             "error_code": self.error_code,
             "reviewed_at": self.reviewed_at,
+            "snapshot_version": self.snapshot_version,
             "rollback_guidance": list(ROLLBACK_GUIDANCE),
         }
 
@@ -233,6 +276,10 @@ class WorkspaceReview:
             final_dirty_paths=tuple(value.get("final_dirty_paths", [])),
             error_code=value.get("error_code"),
             reviewed_at=value.get("reviewed_at"),
+            snapshot_version=value.get(
+                "snapshot_version",
+                LEGACY_WORKSPACE_SNAPSHOT_VERSION,
+            ),
         )
 
 
@@ -347,6 +394,94 @@ class WorkspaceInspector:
         return tuple(sorted(set(normalized)))
 
     @staticmethod
+    def _validate_index_visibility(raw: bytes) -> None:
+        """Reject index flags that intentionally hide tracked worktree changes."""
+
+        for record in raw.split(b"\0"):
+            if not record:
+                continue
+            if len(record) < 3 or record[1:2] != b" ":
+                raise ValidationError("Git returned invalid index visibility metadata")
+            tag = record[0:1]
+            try:
+                path = record[2:].decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValidationError("workspace paths must be valid UTF-8") from exc
+            if not WorkspaceReview._safe_relative_path(path):
+                raise ValidationError("Git returned an unsafe workspace path")
+            if b"a" <= tag <= b"z":
+                raise ValidationError(
+                    "workspace contains assume-unchanged index entries; clear them before review"
+                )
+            if tag == b"S":
+                raise ValidationError(
+                    "workspace contains skip-worktree index entries; use a full checkout for review"
+                )
+            if tag not in {b"H", b"M", b"R", b"C", b"K", b"?"}:
+                raise ValidationError("Git returned unsupported index visibility metadata")
+
+    @staticmethod
+    def _decode_index_entries(
+        raw: bytes,
+        included_paths: Iterable[str],
+    ) -> Dict[str, Tuple[WorkspaceIndexEntry, ...]]:
+        """Decode bounded stage, mode, and object identities for relevant paths."""
+
+        included = set(included_paths)
+        entries: Dict[str, list] = {}
+        for record in raw.split(b"\0"):
+            if not record:
+                continue
+            metadata, separator, raw_path = record.partition(b"\t")
+            if not separator:
+                raise ValidationError("Git returned invalid index entry metadata")
+            try:
+                path = raw_path.decode("utf-8")
+                mode_raw, object_id_raw, stage_raw = metadata.split(b" ")
+                mode = mode_raw.decode("ascii")
+                object_id = object_id_raw.decode("ascii")
+                stage_text = stage_raw.decode("ascii")
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise ValidationError("Git returned invalid index entry metadata") from exc
+            if not WorkspaceReview._safe_relative_path(path):
+                raise ValidationError("Git returned an unsafe workspace path")
+            if path not in included:
+                continue
+            if len(mode) != 6 or any(character not in "01234567" for character in mode):
+                raise ValidationError("Git returned an invalid index mode")
+            if len(object_id) not in (40, 64) or any(
+                character not in "0123456789abcdef" for character in object_id
+            ):
+                raise ValidationError("Git returned an invalid index object id")
+            if stage_text not in {"0", "1", "2", "3"}:
+                raise ValidationError("Git returned an invalid index stage")
+            entries.setdefault(path, []).append(
+                WorkspaceIndexEntry(mode, object_id, int(stage_text))
+            )
+
+        normalized: Dict[str, Tuple[WorkspaceIndexEntry, ...]] = {}
+        for path, path_entries in entries.items():
+            ordered = tuple(
+                sorted(
+                    path_entries,
+                    key=lambda entry: (entry.stage, entry.mode, entry.object_id),
+                )
+            )
+            if len({entry.stage for entry in ordered}) != len(ordered):
+                raise ValidationError("Git returned duplicate index stages for one path")
+            normalized[path] = ordered
+        return normalized
+
+    @staticmethod
+    def _index_digest(entries: Tuple[WorkspaceIndexEntry, ...]) -> str:
+        encoded = json.dumps(
+            [entry.to_dict() for entry in entries],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
     def _path_within_root(root: Path, relative_path: str) -> Path:
         candidate = root.joinpath(*PurePosixPath(relative_path).parts)
         parent = candidate.parent.resolve()
@@ -362,13 +497,28 @@ class WorkspaceInspector:
         relative_path: str,
         tracked: bool,
         staged: bool,
+        index_entries: Tuple[WorkspaceIndexEntry, ...],
         hashed_bytes: int,
     ) -> Tuple[WorkspaceFileState, int]:
         candidate = self._path_within_root(root, relative_path)
+        index_digest = self._index_digest(index_entries)
+        index_entry_count = len(index_entries)
         try:
             metadata = candidate.lstat()
         except FileNotFoundError:
-            return WorkspaceFileState("missing", 0, 0, "", tracked, staged), hashed_bytes
+            return (
+                WorkspaceFileState(
+                    "missing",
+                    0,
+                    0,
+                    "",
+                    tracked,
+                    staged,
+                    index_digest,
+                    index_entry_count,
+                ),
+                hashed_bytes,
+            )
         except OSError as exc:
             raise ValidationError("could not inspect a changed workspace path") from exc
 
@@ -386,6 +536,8 @@ class WorkspaceInspector:
                     hashlib.sha256(target).hexdigest(),
                     tracked,
                     staged,
+                    index_digest,
+                    index_entry_count,
                 ),
                 hashed_bytes + len(target),
             )
@@ -426,12 +578,16 @@ class WorkspaceInspector:
                 digest.hexdigest(),
                 tracked,
                 staged,
+                index_digest,
+                index_entry_count,
             ),
             hashed_bytes + opened_metadata.st_size,
         )
 
     def snapshot(self, workspace_root: Path) -> WorkspaceSnapshot:
         root = self.validate_root(workspace_root)
+        index_visibility_raw = self._run_git(root, ("ls-files", "-v", "-z"))
+        self._validate_index_visibility(index_visibility_raw)
         head_raw = self._run_git(root, ("rev-parse", "--verify", "HEAD^{commit}"))
         branch_raw = self._run_git(
             root,
@@ -463,6 +619,7 @@ class WorkspaceInspector:
             root,
             ("ls-files", "--others", "--ignored", "--exclude-standard", "-z"),
         )
+        index_entries_raw = self._run_git(root, ("ls-files", "--stage", "-z"))
         try:
             head = head_raw.decode("ascii").strip()
             branch_value = branch_raw.decode("utf-8").strip()
@@ -482,6 +639,7 @@ class WorkspaceInspector:
         paths = tracked_paths.union(staged_paths, untracked_paths)
         if len(paths) > MAX_WORKSPACE_PATHS:
             raise ValidationError("workspace has too many changed paths to review safely")
+        index_entries = self._decode_index_entries(index_entries_raw, paths)
 
         files: Dict[str, WorkspaceFileState] = {}
         hashed_bytes = 0
@@ -491,11 +649,27 @@ class WorkspaceInspector:
                 relative_path,
                 relative_path not in untracked_paths,
                 relative_path in staged_paths,
+                index_entries.get(relative_path, ()),
                 hashed_bytes,
             )
             files[relative_path] = file_state
 
+        legacy_digest_value = {
+            "root": str(root),
+            "head": head,
+            "branch": branch,
+            "files": {path: files[path].to_legacy_dict() for path in sorted(files)},
+        }
+        legacy_digest = hashlib.sha256(
+            json.dumps(
+                legacy_digest_value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
         digest_value = {
+            "snapshot_version": WORKSPACE_SNAPSHOT_VERSION,
             "root": str(root),
             "head": head,
             "branch": branch,
@@ -509,12 +683,21 @@ class WorkspaceInspector:
                 ensure_ascii=False,
             ).encode("utf-8")
         ).hexdigest()
-        return WorkspaceSnapshot(str(root), head, branch, files, digest)
+        return WorkspaceSnapshot(
+            str(root),
+            head,
+            branch,
+            files,
+            digest,
+            legacy_digest,
+        )
 
     @staticmethod
     def compare(before: WorkspaceSnapshot, after: WorkspaceSnapshot) -> WorkspaceReview:
         if before.root != after.root:
             raise ValidationError("workspace snapshots have different roots")
+        if before.snapshot_version != after.snapshot_version:
+            raise ValidationError("workspace snapshots have different versions")
         before_paths = set(before.files)
         after_paths = set(after.files)
         introduced = tuple(sorted(after_paths.difference(before_paths)))
@@ -541,6 +724,7 @@ class WorkspaceInspector:
             modified_paths=modified,
             removed_paths=removed,
             final_dirty_paths=after.dirty_paths,
+            snapshot_version=before.snapshot_version,
         )
 
     @staticmethod
@@ -556,4 +740,5 @@ class WorkspaceInspector:
             after_branch=None,
             preexisting_paths=before.dirty_paths,
             error_code=error_code,
+            snapshot_version=before.snapshot_version,
         )
