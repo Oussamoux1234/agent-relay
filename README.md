@@ -30,7 +30,7 @@ The MVP answers one question: **can a user register arbitrary agents and move a 
 - Opt a reviewed Codex CLI or Codex App Server write preset into one exact task and Git root.
 - Snapshot Git state before and after a write, then require explicit change acceptance or verified rollback.
 - Keep every write-capable agent out of automatic fallback routes.
-- Persist local state atomically with owner-only permissions where the filesystem supports them.
+- Persist local state atomically with owner-only permissions where the filesystem supports them, without following managed-path symlinks.
 
 Agent Relay does not claim to transfer a model's hidden reasoning or private session. It transfers an auditable set of facts about the task.
 
@@ -111,6 +111,8 @@ python3 -m agent_relay agent add my-agent \
 The example flag is illustrative; use the non-interactive invocation supported by the locally installed agent. Environment values are never stored. Only base process variables and explicitly allowed names are passed to the child.
 
 Custom adapters still run with the user's operating-system permissions and can access the selected working directory. Relay coordinates agents; it is not itself an operating-system sandbox. The reviewed Codex presets additionally request Codex's own read-only or workspace-write sandbox. Captured stdout and stderr are bounded and returned to the invoking user, but are not added to the checkpoint ledger.
+
+The state store canonicalizes parent components but requires the selected state root itself, its managed `tasks` directory, and every managed JSON file to be real directories or regular files rather than symlinks. It keeps directory identities for the lifetime of the process and performs reads, temporary-file creation, replacement, and cleanup relative to verified directory descriptors. If a managed directory is replaced or the platform cannot provide the required safe path operations, Relay fails closed instead of following the new path.
 
 ## Built-in provider presets
 

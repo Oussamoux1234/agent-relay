@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
+import stat
+import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .errors import ConflictError, NotFoundError, ValidationError
 from .health import AgentHealthRecord, HEALTH_SCHEMA_VERSION, MAX_HEALTH_RECORDS
@@ -17,67 +18,238 @@ class RelayStore:
     """Stores user-owned agent definitions and checkpoints under one directory."""
 
     def __init__(self, root: Path) -> None:
-        self.root = Path(root).expanduser().resolve()
+        requested_root = Path(root).expanduser()
+        absolute_root = Path(os.path.abspath(str(requested_root)))
+        self.root = absolute_root.parent.resolve() / absolute_root.name
+        if self.root.is_symlink():
+            raise ValidationError("state root must not be a symlink")
         self.registry_path = self.root / "agents.json"
         self.health_path = self.root / "health.json"
         self.tasks_dir = self.root / "tasks"
-        self._ensure_private_directory(self.root)
-        self._ensure_private_directory(self.tasks_dir)
+        self._root_identity = self._ensure_private_directory(self.root)
+        self._tasks_identity = self._ensure_private_child_directory("tasks")
 
     @staticmethod
-    def _ensure_private_directory(path: Path) -> None:
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    def _directory_flags() -> int:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        return flags | getattr(os, "O_CLOEXEC", 0)
+
+    @classmethod
+    def _ensure_private_directory(cls, path: Path) -> Tuple[int, int]:
         try:
-            path.chmod(0o700)
-        except OSError:
-            # Some mounted filesystems do not implement POSIX permission changes.
-            pass
+            path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ValidationError("could not create state directory: %s" % path.name) from exc
+        descriptor = cls._open_directory(path)
+        try:
+            opened = os.fstat(descriptor)
+            try:
+                os.fchmod(descriptor, 0o700)
+            except OSError:
+                # Some mounted filesystems do not implement POSIX permission changes.
+                pass
+            return opened.st_dev, opened.st_ino
+        finally:
+            os.close(descriptor)
+
+    @classmethod
+    def _open_directory(
+        cls,
+        path: Path,
+        expected_identity: Optional[Tuple[int, int]] = None,
+    ) -> int:
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise ValidationError("state directory is unavailable: %s" % path.name) from exc
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ValidationError("state directory must not be a symlink: %s" % path.name)
+        descriptor = None
+        try:
+            descriptor = os.open(str(path), cls._directory_flags())
+            opened = os.fstat(descriptor)
+        except OSError as exc:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise ValidationError("state directory is unavailable: %s" % path.name) from exc
+        if opened.st_dev != metadata.st_dev or opened.st_ino != metadata.st_ino:
+            os.close(descriptor)
+            raise ValidationError("state directory changed during validation: %s" % path.name)
+        if expected_identity is not None and expected_identity != (opened.st_dev, opened.st_ino):
+            os.close(descriptor)
+            raise ValidationError("managed state directory was replaced: %s" % path.name)
+        return descriptor
+
+    def _open_root_directory(self) -> int:
+        return self._open_directory(self.root, self._root_identity)
+
+    @classmethod
+    def _open_child_directory(
+        cls,
+        parent_descriptor: int,
+        name: str,
+        expected_identity: Optional[Tuple[int, int]] = None,
+    ) -> int:
+        try:
+            metadata = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except OSError as exc:
+            raise ValidationError("state directory is unavailable: %s" % name) from exc
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ValidationError("state directory must not be a symlink: %s" % name)
+        descriptor = None
+        try:
+            descriptor = os.open(name, cls._directory_flags(), dir_fd=parent_descriptor)
+            opened = os.fstat(descriptor)
+        except OSError as exc:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise ValidationError("state directory is unavailable: %s" % name) from exc
+        if opened.st_dev != metadata.st_dev or opened.st_ino != metadata.st_ino:
+            os.close(descriptor)
+            raise ValidationError("state directory changed during validation: %s" % name)
+        if expected_identity is not None and expected_identity != (opened.st_dev, opened.st_ino):
+            os.close(descriptor)
+            raise ValidationError("managed state directory was replaced: %s" % name)
+        return descriptor
+
+    def _ensure_private_child_directory(self, name: str) -> Tuple[int, int]:
+        parent_descriptor = self._open_root_directory()
+        descriptor = None
+        try:
+            try:
+                os.mkdir(name, mode=0o700, dir_fd=parent_descriptor)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise ValidationError("could not create state directory: %s" % name) from exc
+            descriptor = self._open_child_directory(parent_descriptor, name)
+            opened = os.fstat(descriptor)
+            try:
+                os.fchmod(descriptor, 0o700)
+            except OSError:
+                # Some mounted filesystems do not implement POSIX permission changes.
+                pass
+            return opened.st_dev, opened.st_ino
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(parent_descriptor)
+
+    def _open_tasks_directory(self) -> int:
+        parent_descriptor = self._open_root_directory()
+        try:
+            return self._open_child_directory(
+                parent_descriptor,
+                "tasks",
+                self._tasks_identity,
+            )
+        finally:
+            os.close(parent_descriptor)
+
+    def _open_parent(self, path: Path) -> int:
+        if path.parent == self.root:
+            return self._open_root_directory()
+        if path.parent == self.tasks_dir:
+            return self._open_tasks_directory()
+        raise ValidationError("state file is outside the managed state directories")
 
     @staticmethod
-    def _read_json(path: Path) -> Dict[str, Any]:
+    def _file_metadata(parent_descriptor: int, name: str) -> Optional[os.stat_result]:
         try:
-            with path.open("r", encoding="utf-8") as handle:
-                value = json.load(handle)
+            metadata = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
         except FileNotFoundError:
-            raise NotFoundError("state file was not found: %s" % path.name)
+            return None
+        except OSError as exc:
+            raise ValidationError("could not inspect state file: %s" % name) from exc
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise ValidationError("state file must be a regular file, not a symlink: %s" % name)
+        return metadata
+
+    def _state_file_exists(self, path: Path) -> bool:
+        parent_descriptor = self._open_parent(path)
+        try:
+            return self._file_metadata(parent_descriptor, path.name) is not None
+        finally:
+            os.close(parent_descriptor)
+
+    def _read_json(self, path: Path) -> Dict[str, Any]:
+        parent_descriptor = self._open_parent(path)
+        descriptor = None
+        try:
+            metadata = self._file_metadata(parent_descriptor, path.name)
+            if metadata is None:
+                raise NotFoundError("state file was not found: %s" % path.name)
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_dev != metadata.st_dev
+                or opened.st_ino != metadata.st_ino
+            ):
+                raise ValidationError("state file changed during validation: %s" % path.name)
+            with os.fdopen(descriptor, "r", encoding="utf-8", closefd=True) as handle:
+                descriptor = None
+                value = json.load(handle)
+        except NotFoundError:
+            raise
+        except ValidationError:
+            raise
         except (OSError, json.JSONDecodeError) as exc:
             raise ValidationError("state file is unreadable or invalid: %s" % path.name) from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(parent_descriptor)
         if not isinstance(value, dict):
             raise ValidationError("state file must contain a JSON object: %s" % path.name)
         return value
 
-    @staticmethod
-    def _atomic_write(path: Path, value: Dict[str, Any]) -> None:
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        temporary_path = None
+    def _atomic_write(self, path: Path, value: Dict[str, Any]) -> None:
+        parent_descriptor = self._open_parent(path)
+        temporary_name = ".%s.%s.tmp" % (path.name, uuid.uuid4().hex)
+        descriptor = None
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=str(path.parent),
-                prefix=".%s." % path.name,
-                suffix=".tmp",
-                delete=False,
-            ) as handle:
-                temporary_path = Path(handle.name)
-                os.chmod(handle.name, 0o600)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            descriptor = os.open(temporary_name, flags, 0o600, dir_fd=parent_descriptor)
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8", closefd=True) as handle:
+                descriptor = None
                 json.dump(value, handle, indent=2, sort_keys=True, ensure_ascii=False)
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(str(temporary_path), str(path))
-            temporary_path = None
+            self._file_metadata(parent_descriptor, path.name)
+            os.replace(
+                temporary_name,
+                path.name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+            temporary_name = ""
+            try:
+                os.fsync(parent_descriptor)
+            except OSError:
+                # The replacement completed; some filesystems cannot sync directories.
+                pass
+        except ValidationError:
+            raise
         except OSError as exc:
             raise ValidationError("could not persist state file: %s" % path.name) from exc
         finally:
-            if temporary_path is not None:
+            if descriptor is not None:
+                os.close(descriptor)
+            if temporary_name:
                 try:
-                    temporary_path.unlink()
+                    os.unlink(temporary_name, dir_fd=parent_descriptor)
                 except FileNotFoundError:
                     pass
+            os.close(parent_descriptor)
 
     def _read_registry(self) -> Dict[str, Any]:
-        if not self.registry_path.exists():
+        if not self._state_file_exists(self.registry_path):
             return {"schema_version": SCHEMA_VERSION, "agents": {}}
         registry = self._read_json(self.registry_path)
         if registry.get("schema_version") != SCHEMA_VERSION:
@@ -107,7 +279,7 @@ class RelayStore:
         return [AgentSpec.from_dict(value) for _, value in sorted(registry["agents"].items())]
 
     def _read_health(self) -> Dict[str, Any]:
-        if not self.health_path.exists():
+        if not self._state_file_exists(self.health_path):
             return {"schema_version": HEALTH_SCHEMA_VERSION, "agents": {}}
         health = self._read_json(self.health_path)
         if health.get("schema_version") != HEALTH_SCHEMA_VERSION:
@@ -160,14 +332,14 @@ class RelayStore:
 
     def create_task(self, checkpoint: TaskCheckpoint) -> TaskCheckpoint:
         path = self._task_path(checkpoint.task_id)
-        if path.exists():
+        if self._state_file_exists(path):
             raise ConflictError("task already exists: %s" % checkpoint.task_id)
         self._atomic_write(path, checkpoint.to_dict())
         return checkpoint
 
     def get_task(self, task_id: str) -> TaskCheckpoint:
         path = self._task_path(task_id)
-        if not path.exists():
+        if not self._state_file_exists(path):
             raise NotFoundError("task not found: %s" % task_id)
         return TaskCheckpoint.from_dict(self._read_json(path))
 
@@ -186,6 +358,15 @@ class RelayStore:
 
     def list_tasks(self) -> List[TaskCheckpoint]:
         checkpoints = []
-        for path in sorted(self.tasks_dir.glob("*.json")):
-            checkpoints.append(TaskCheckpoint.from_dict(self._read_json(path)))
+        directory_descriptor = self._open_tasks_directory()
+        try:
+            names = sorted(os.listdir(directory_descriptor))
+        except OSError as exc:
+            raise ValidationError("could not list state tasks") from exc
+        finally:
+            os.close(directory_descriptor)
+        for name in names:
+            if name.endswith(".json"):
+                path = self.tasks_dir / name
+                checkpoints.append(TaskCheckpoint.from_dict(self._read_json(path)))
         return checkpoints
