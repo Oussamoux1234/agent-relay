@@ -116,7 +116,13 @@ class WorkspaceReviewOutcome:
 
 
 AUTO_ROUTE_PROVIDER_IDS = frozenset(
-    ("antigravity-cli", "claude-code", "codex-cli", "gemini-cli")
+    (
+        "antigravity-cli",
+        "claude-code",
+        "codex-cli",
+        "gemini-cli",
+        "github-copilot",
+    )
 )
 WORKSPACE_WRITE_PROVIDER_IDS = frozenset(
     ("claude-code-write", "codex-cli-write", "codex-app-server-write")

@@ -10,7 +10,7 @@ The MVP answers one question: **can a user register arbitrary agents and move a 
 ## What works now
 
 - Register any local executable as an agent adapter.
-- Register reviewed presets for Codex CLI, Codex App Server, Claude Code, Gemini CLI, and Antigravity CLI.
+- Register reviewed presets for Codex CLI, Codex App Server, Claude Code, Gemini CLI, Antigravity CLI, and GitHub Copilot CLI.
 - Describe its fixed arguments, prompt transport, capabilities, timeout, and permitted environment-variable names.
 - Create a versioned, inspectable task checkpoint.
 - Record summaries, decisions, constraints, changed files, tests, and next steps.
@@ -20,7 +20,7 @@ The MVP answers one question: **can a user register arbitrary agents and move a 
 - Return a Codex App answer while retaining only safe thread/turn metadata and an explicit result proposal.
 - Record every handoff as pending before the target process starts.
 - Mark manual-handoff timeouts and non-zero exits as `unknown` and block further handoffs until the user resolves the outcome.
-- Configure an ordered route across Codex, Claude, Gemini, and Antigravity preset instances.
+- Configure an ordered route across Codex, Claude, Gemini, Antigravity, and GitHub Copilot preset instances.
 - Continue to the next read-only agent after a documented quota/rate-limit signal or a process that could not start.
 - Persist redacted health per agent instance and skip entries whose cooldown is still active.
 - Inspect or clear cooldowns and explicitly recover a task to an earlier route entry.
@@ -41,6 +41,7 @@ Agent Relay does not claim to transfer a model's hidden reasoning or private ses
 User ──> Relay service contract ──┼─ Claude Code adapter
               │                   ├─ Gemini CLI adapter
               │                   ├─ Antigravity adapter
+              │                   ├─ GitHub Copilot CLI adapter
               │                   ├─ Codex App Server adapter
               │                   └─ custom command adapter
               │
@@ -145,7 +146,7 @@ Read-only planning remains the default. Three separately named presets expose th
 | `claude-code-write` | `claude` | restricted mode with repository file tools only; requires Claude Code 2.1.248+ |
 | `gemini-cli` | `gemini` | headless plan approval mode |
 | `antigravity-cli` | `agy` | plan mode with JSON-lines stdin |
-| `github-copilot` | `copilot` | read tools only; parked for the later GitHub Education phase |
+| `github-copilot` | `copilot` | non-interactive JSONL with only `view`, `glob`, and `grep` tools |
 
 Install and authenticate a provider through its own official workflow, then register only the presets you use:
 
@@ -155,6 +156,7 @@ python3 -m agent_relay agent add-preset codex-app-server
 python3 -m agent_relay agent add-preset claude-code
 python3 -m agent_relay agent add-preset gemini-cli
 python3 -m agent_relay agent add-preset antigravity-cli
+python3 -m agent_relay agent add-preset github-copilot
 ```
 
 Every preset follows the same baseline:
@@ -165,7 +167,7 @@ Every preset follows the same baseline:
 - Relay reuses the CLI's local authentication and never stores provider tokens.
 - Dangerous auto-approval and permission-bypass flags are not enabled.
 
-Existing read registrations are never upgraded to write access. Codex write behavior follows OpenAI's documented [sandbox and approval model](https://learn.chatgpt.com/codex/sandboxing) and [writable-root permissions](https://learn.chatgpt.com/codex/permissions). Claude write behavior follows Anthropic's documented [restricted mode](https://code.claude.com/docs/en/permission-modes) and [CLI permission controls](https://code.claude.com/docs/en/permissions). Other provider behavior is based on the official [Codex non-interactive guide](https://developers.openai.com/codex/noninteractive), [Claude Code CLI reference](https://code.claude.com/docs/en/cli-usage), [Gemini CLI headless guide](https://geminicli.com/docs/cli/headless/), and [Antigravity headless guide](https://antigravity.google/docs/cli/headless/).
+Existing read registrations are never upgraded to write access. Codex write behavior follows OpenAI's documented [sandbox and approval model](https://learn.chatgpt.com/codex/sandboxing) and [writable-root permissions](https://learn.chatgpt.com/codex/permissions). Claude write behavior follows Anthropic's documented [restricted mode](https://code.claude.com/docs/en/permission-modes) and [CLI permission controls](https://code.claude.com/docs/en/permissions). Other provider behavior is based on the official [Codex non-interactive guide](https://developers.openai.com/codex/noninteractive), [Claude Code CLI reference](https://code.claude.com/docs/en/cli-usage), [Gemini CLI headless guide](https://geminicli.com/docs/cli/headless/), [Antigravity headless guide](https://antigravity.google/docs/cli/headless/), and [GitHub Copilot CLI command reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference).
 
 ### Codex App support
 
@@ -202,7 +204,38 @@ The current safety boundary is intentional:
 
 This is a supported protocol integration, not desktop UI automation. Relay does not click or scrape the Codex app, discover private tasks, attach to a currently running UI process, or impersonate a browser session. It starts a local App Server process and can resume only a thread ID available to that configured Codex installation. App Server handoffs are manual and are not included in automatic quota routing yet.
 
-GitHub Copilot remains available as a parked preset for the later GitHub Education phase; it is not part of the current connector rollout.
+### GitHub Copilot and GitHub Education
+
+The `github-copilot` preset is an active read-only fallback adapter. It sends the
+checkpoint through stdin, requests JSONL output, and makes only Copilot's `view`,
+`glob`, and `grep` tools available. It also denies write, shell, URL, and memory
+permissions and disables built-in MCP, custom instructions, experimental behavior,
+remote sessions, remote export, temporary-directory access, prompts, automatic
+updates, and session logging. GitHub documents the underlying
+[tool allowlist and deny rules](https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/allowing-tools).
+
+Install and authenticate the official CLI first, then register it:
+
+```bash
+copilot login
+python3 -m agent_relay agent add-preset github-copilot --id copilot-read
+```
+
+Relay reuses Copilot CLI's local OAuth login or GitHub CLI fallback. It does not
+store, mint, refresh, or choose GitHub tokens. Authentication or organization-policy
+errors fail closed. The preset recognizes GitHub's documented rate-limit wording as
+transient and exhausted AI credits as quota exhaustion; neither classification
+changes, extends, or bypasses the user's GitHub plan.
+
+GitHub Education is an entitlement managed entirely by GitHub, not a Relay feature.
+Verified students can activate Copilot Student from their
+[Education benefits page](https://github.com/settings/education/benefits); GitHub
+documents that Education approval and Copilot activation are separate and that
+eligibility is reevaluated monthly. Relay works the same with Student, Free, paid,
+and organization-provided access when the installed CLI and account policy permit
+it. See GitHub's [student setup guide](https://docs.github.com/en/copilot/how-tos/copilot-on-github/set-up-copilot/enable-copilot/set-up-for-students),
+[CLI installation guide](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli),
+and [authentication guide](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/authenticate-copilot-cli).
 
 ### Explicit workspace-write flow
 
@@ -309,7 +342,8 @@ python3 -m agent_relay route set TASK_ID \
   --agent codex-primary \
   --agent codex-backup \
   --agent claude-primary \
-  --agent gemini-cli
+  --agent gemini-cli \
+  --agent copilot-read
 
 python3 -m agent_relay route show TASK_ID
 ```
@@ -362,7 +396,7 @@ python3 -m agent_relay route recover TASK_ID codex-primary
 
 Recovery changes only the active route pointer, writes an auditable `route-recover` action, and launches no provider process. The next `route run` remains preview-first unless `--execute` is supplied.
 
-The detector recognizes documented signals such as OpenAI 429/quota codes, Claude `rate_limit_error`, and Gemini `429 RESOURCE_EXHAUSTED`. The cooldown fields follow the official [OpenAI error-code guide](https://developers.openai.com/api/docs/guides/error-codes), [Claude rate-limit reference](https://platform.claude.com/docs/en/api/rate-limits), and [Google `RetryInfo` contract](https://docs.cloud.google.com/php/docs/reference/common-protos/latest/Rpc.RetryInfo). General classification also follows the [Claude API error reference](https://platform.claude.com/docs/en/api/errors) and [Gemini troubleshooting guide](https://ai.google.dev/gemini-api/docs/troubleshooting).
+The detector recognizes documented signals such as OpenAI 429/quota codes, Claude `rate_limit_error`, Gemini `429 RESOURCE_EXHAUSTED`, and Copilot rate-limit or AI-credit exhaustion messages. The cooldown fields follow the official [OpenAI error-code guide](https://developers.openai.com/api/docs/guides/error-codes), [Claude rate-limit reference](https://platform.claude.com/docs/en/api/rate-limits), [Google `RetryInfo` contract](https://docs.cloud.google.com/php/docs/reference/common-protos/latest/Rpc.RetryInfo), [GitHub Copilot troubleshooting guide](https://docs.github.com/en/copilot/how-tos/troubleshoot-copilot/troubleshoot-common-issues), and [GitHub usage-limit guide](https://docs.github.com/en/copilot/concepts/usage-limits). General classification also follows the [Claude API error reference](https://platform.claude.com/docs/en/api/errors) and [Gemini troubleshooting guide](https://ai.google.dev/gemini-api/docs/troubleshooting).
 
 Failure attempts persist only classifications and execution metadata. Successful attempts may persist a bounded, validated result proposal for review. Raw stdout and stderr are returned to the invoking user but are not written into the task ledger. Automatic routing currently applies to Relay-launched CLI processes. It cannot observe a limit encountered inside an unrelated Codex App, Claude Code, or Antigravity session.
 
@@ -428,7 +462,7 @@ The GitHub Actions workflow runs the same suite on Python 3.9 through 3.14 with 
 
 - Manual handoffs, including Codex App Server turns, remain user-confirmed; ordered CLI routes can automatically continue only after conservative limit classification.
 - The adapter launches CLI processes but does not scrape or impersonate consumer subscriptions.
-- Read-only or plan-only presets remain the default; write access supports only the separately named Codex CLI, Codex App Server, and restricted Claude Code write presets. Gemini and Antigravity remain read/plan-only.
+- Read-only or plan-only presets remain the default; write access supports only the separately named Codex CLI, Codex App Server, and restricted Claude Code write presets. Gemini, Antigravity, and GitHub Copilot remain read/plan-only.
 - Codex App integration is limited to documented local App Server stdio calls; live desktop UI control, task discovery, WebSocket transport, and automatic app routing are not implemented.
 - Workspace review records content-free Git state metadata, not raw patch contents; the user must inspect the real Git diff before acceptance.
 - Structured result fields and reported tests remain agent claims; Relay does not independently execute tests.
@@ -444,4 +478,6 @@ Agent Relay is licensed under the [Apache License 2.0](LICENSE).
 
 ## Roadmap
 
-[GitHub Education/Copilot support](https://github.com/Oussamoux1234/agent-relay/issues/7) remains deliberately parked for a later milestone. New provider write presets will be added only when current official controls can preserve the same exact task/agent/root and review boundary.
+GitHub Education/Copilot read-only support is delivered in v0.9.0. New provider
+write presets will be added only when current official controls can preserve the
+same exact task/agent/root and review boundary.

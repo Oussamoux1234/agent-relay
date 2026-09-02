@@ -46,6 +46,17 @@ class FailureClassifierTestCase(unittest.TestCase):
             ("claude-code", '{"type":"rate_limit_error"}', "rate_limited"),
             ("gemini-cli", "429 RESOURCE_EXHAUSTED", "rate_limited"),
             ("antigravity-cli", "status=RESOURCE_EXHAUSTED", "rate_limited"),
+            ("github-copilot", "You've hit a rate limit", "rate_limited"),
+            (
+                "github-copilot",
+                "Your included AI credits are exhausted",
+                "quota_exhausted",
+            ),
+            (
+                "github-copilot",
+                "session_limits_exhausted.requested",
+                "quota_exhausted",
+            ),
         )
 
         for provider_id, message, category in cases:
@@ -65,6 +76,21 @@ class FailureClassifierTestCase(unittest.TestCase):
 
         self.assertEqual(classification.category, "authentication")
         self.assertFalse(classification.safe_to_fallback)
+
+    def test_copilot_authentication_signals_fail_closed(self) -> None:
+        for message in (
+            "No authentication information found",
+            "Access denied by policy settings",
+            "Classic personal access tokens are not supported",
+        ):
+            with self.subTest(message=message):
+                classification = self.classifier.classify(
+                    self.spec("github-copilot"),
+                    self.result(message),
+                )
+
+                self.assertEqual(classification.category, "authentication")
+                self.assertFalse(classification.safe_to_fallback)
 
     def test_timeout_overload_and_unknown_fail_closed(self) -> None:
         cases = (

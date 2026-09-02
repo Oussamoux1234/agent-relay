@@ -31,6 +31,12 @@ AUTHENTICATION_PATTERNS = _compile(
         ("http-auth-status", r"\b(?:http(?: status)?\s*[:=]?\s*)?(?:401|403)\b"),
         ("invalid-api-key", r"\b(?:incorrect|invalid|expired|revoked) api key\b"),
         ("login-required", r"\b(?:not logged in|please (?:log|sign) in)\b"),
+        ("authentication-missing", r"\bno authentication information found\b"),
+        ("authentication-policy-denied", r"\baccess denied by policy settings\b"),
+        (
+            "unsupported-classic-token",
+            r"\bclassic personal access tokens? (?:are|is) not supported\b",
+        ),
         ("unauthorized", r"\b(?:unauthorized|forbidden)\b"),
     )
 )
@@ -74,6 +80,25 @@ RATE_LIMIT_PATTERNS = _compile(
 PROVIDER_PATTERNS: Dict[str, Tuple[Tuple[str, Pattern[str]], ...]] = {
     "antigravity-cli": _compile((("gemini-resource-exhausted", r"\bresource_exhausted\b"),)),
     "gemini-cli": _compile((("gemini-resource-exhausted", r"\bresource_exhausted\b"),)),
+    "github-copilot": _compile(
+        (("copilot-rate-limit-hit", r"\byou(?:'|’)?ve hit a rate limit\b"),)
+    ),
+}
+
+PROVIDER_QUOTA_PATTERNS: Dict[str, Tuple[Tuple[str, Pattern[str]], ...]] = {
+    "github-copilot": _compile(
+        (
+            (
+                "copilot-ai-credits-exhausted",
+                r"\b(?:your\s+)?(?:included\s+)?ai credits?\s+(?:are\s+)?exhausted\b"
+                r"|\bexhausted\s+(?:your\s+)?(?:included\s+)?ai credits?\b",
+            ),
+            (
+                "copilot-session-limit-exhausted",
+                r"\bsession_limits_exhausted\.requested\b",
+            ),
+        )
+    ),
 }
 
 OVERLOAD_PATTERNS = _compile(
@@ -115,6 +140,14 @@ class FailureClassifier:
         evidence = self._match(text, AUTHENTICATION_PATTERNS)
         if evidence is not None:
             return FailureClassification("authentication", False, evidence)
+
+        if spec.provider_id is not None:
+            evidence = self._match(
+                text,
+                PROVIDER_QUOTA_PATTERNS.get(spec.provider_id, ()),
+            )
+            if evidence is not None:
+                return FailureClassification("quota_exhausted", True, evidence)
 
         evidence = self._match(text, QUOTA_PATTERNS)
         if evidence is not None:

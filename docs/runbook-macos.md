@@ -51,6 +51,20 @@ For the other providers, use their official installation and authentication guid
 - [Gemini CLI installation](https://geminicli.com/docs/get-started/installation/)
 - [Antigravity CLI overview](https://antigravity.google/docs/cli/)
 
+Install GitHub Copilot CLI using its official Homebrew cask, then authenticate with
+GitHub's OAuth device flow:
+
+```bash
+brew install --cask copilot-cli
+copilot login
+```
+
+GitHub Education eligibility is separate from Relay. Verified students must activate
+Copilot Student from the
+[GitHub Education benefits page](https://github.com/settings/education/benefits)
+before logging in. GitHub documents the complete
+[student activation flow](https://docs.github.com/en/copilot/how-tos/copilot-on-github/set-up-copilot/enable-copilot/set-up-for-students).
+
 Confirm each installed executable from the same Terminal session:
 
 ```bash
@@ -58,6 +72,7 @@ codex --version
 claude --version
 gemini --version
 agy --help
+copilot --version
 agent-relay agent presets
 ```
 
@@ -74,6 +89,7 @@ agent-relay agent add-preset codex-app-server --id codex-app-read
 agent-relay agent add-preset claude-code --id claude-read
 agent-relay agent add-preset gemini-cli --id gemini-read
 agent-relay agent add-preset antigravity-cli --id antigravity-read
+agent-relay agent add-preset github-copilot --id copilot-read
 
 agent-relay agent list
 ```
@@ -121,7 +137,8 @@ agent-relay route set TASK_ID \
   --agent codex-read \
   --agent claude-read \
   --agent gemini-read \
-  --agent antigravity-read
+  --agent antigravity-read \
+  --agent copilot-read
 
 agent-relay route show TASK_ID
 agent-relay route run TASK_ID
@@ -205,6 +222,12 @@ otherwise protect repository work.
   fix `PATH`, then retry `agent-relay agent add-preset`.
 - **Provider authentication failure:** run the provider directly and sign in again.
   Relay intentionally blocks; it does not switch accounts or providers automatically.
+- **Copilot authentication or policy failure:** run `copilot login`, then start
+  `copilot` and use `/user` to verify the selected account. Organization-provided
+  Copilot also requires the Copilot CLI policy to be enabled by the organization.
+- **Student benefit is missing:** GitHub Education approval and Copilot Student
+  activation are separate. Revisit the Education benefits page; do not buy a plan
+  solely to work around a benefit that is still being applied.
 - **Claude rejects `--restricted`:** upgrade Claude Code to 2.1.248 or newer. Do not
   replace it with `--dangerously-skip-permissions`.
 - **Root rejected:** `cd` to the repository and use the exact output of
@@ -213,4 +236,3 @@ otherwise protect repository work.
   unknown actions explicitly, or use the workspace review/rollback flow for writes.
 - **State directory rejected:** ensure `.agent-relay`, its `tasks` directory, and its
   managed files are real local paths, not symlinks. Do not edit state JSON manually.
-

@@ -75,6 +75,32 @@ class RoutingTestCase(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertNotIn("rate_limit_error", persisted_text)
 
+    def test_copilot_rate_limit_switches_to_the_next_read_agent(self) -> None:
+        self.register(
+            "copilot-primary",
+            "import sys; sys.stderr.write(\"You've hit a rate limit\"); "
+            "raise SystemExit(1)",
+            provider_id="github-copilot",
+        )
+        self.register("codex-backup", "print('backup')")
+        task = self.create_routed_task("copilot-primary", "codex-backup")
+
+        outcome = self.service.run_route(task.task_id, self.root)
+
+        self.assertEqual(
+            [item.agent_id for item in outcome.attempts],
+            ["copilot-primary", "codex-backup"],
+        )
+        self.assertEqual(outcome.attempts[0].classification.category, "rate_limited")
+        self.assertEqual(
+            outcome.attempts[0].classification.evidence_code,
+            "copilot-rate-limit-hit",
+        )
+        self.assertEqual(outcome.task.active_agent, "codex-backup")
+        health = self.service.get_agent_health("copilot-primary")
+        self.assertEqual(health.category, "rate_limited")
+        self.assertEqual(health.evidence_code, "copilot-rate-limit-hit")
+
     def test_ambiguous_failure_blocks_without_running_backup(self) -> None:
         marker = self.root / "backup-ran"
         self.register(

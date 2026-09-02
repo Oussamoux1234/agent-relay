@@ -88,7 +88,23 @@ EXPECTED_ARGUMENTS = {
         "--output-format",
         "json",
     ),
-    "github-copilot": ("-s", "--available-tools=read", "--disable-builtin-mcps"),
+    "github-copilot": (
+        "-s",
+        "--available-tools=view,glob,grep",
+        "--deny-tool=write,shell,url,memory",
+        "--disable-builtin-mcps",
+        "--no-custom-instructions",
+        "--no-experimental",
+        "--no-remote",
+        "--no-remote-export",
+        "--disallow-temp-dir",
+        "--no-ask-user",
+        "--no-auto-update",
+        "--no-bash-env",
+        "--no-color",
+        "--log-level=none",
+        "--output-format=json",
+    ),
 }
 
 
@@ -162,6 +178,19 @@ class ProviderPresetTestCase(unittest.TestCase):
                 self.assertNotIn("bypassPermissions", spec.command)
                 self.assertNotIn("--yolo", spec.command)
                 self.assertNotIn("--dangerously-skip-permissions", spec.command)
+
+    def test_copilot_preset_exposes_only_repository_read_tools(self) -> None:
+        arguments = PRESETS["github-copilot"].fixed_arguments
+
+        self.assertIn("--available-tools=view,glob,grep", arguments)
+        self.assertIn("--deny-tool=write,shell,url,memory", arguments)
+        self.assertIn("--disable-builtin-mcps", arguments)
+        self.assertIn("--no-custom-instructions", arguments)
+        self.assertIn("--no-remote", arguments)
+        self.assertNotIn("--allow-all", arguments)
+        self.assertNotIn("--allow-all-tools", arguments)
+        self.assertNotIn("--allow-all-paths", arguments)
+        self.assertNotIn("--allow-all-urls", arguments)
 
     def test_claude_write_preset_is_restricted_to_repository_file_tools(self) -> None:
         arguments = PRESETS["claude-code-write"].fixed_arguments

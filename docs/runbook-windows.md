@@ -87,6 +87,21 @@ Linux instructions inside WSL:
 - [Gemini CLI installation](https://geminicli.com/docs/get-started/installation/)
 - [Antigravity CLI overview](https://antigravity.google/docs/cli/)
 
+Install GitHub Copilot CLI inside WSL with GitHub's Linux installer, then use the
+OAuth device flow. If the browser opens on Windows, finish authorization there and
+return to the WSL terminal:
+
+```bash
+curl -fsSL https://gh.io/copilot-install | bash
+copilot login
+```
+
+GitHub Education eligibility is separate from Relay. Verified students must activate
+Copilot Student from the
+[GitHub Education benefits page](https://github.com/settings/education/benefits).
+GitHub's [student setup guide](https://docs.github.com/en/copilot/how-tos/copilot-on-github/set-up-copilot/enable-copilot/set-up-for-students)
+explains the separate verification and activation steps.
+
 Verify each provider that you installed:
 
 ```bash
@@ -94,6 +109,7 @@ codex --version
 claude --version
 gemini --version
 agy --help
+copilot --version
 agent-relay agent presets
 ```
 
@@ -109,6 +125,7 @@ agent-relay agent add-preset codex-app-server --id codex-app-read
 agent-relay agent add-preset claude-code --id claude-read
 agent-relay agent add-preset gemini-cli --id gemini-read
 agent-relay agent add-preset antigravity-cli --id antigravity-read
+agent-relay agent add-preset github-copilot --id copilot-read
 ```
 
 Create a task, copy its `task_id`, then preview and execute the fallback route:
@@ -123,7 +140,8 @@ agent-relay route set TASK_ID \
   --agent codex-read \
   --agent claude-read \
   --agent gemini-read \
-  --agent antigravity-read
+  --agent antigravity-read \
+  --agent copilot-read
 
 agent-relay route show TASK_ID
 agent-relay route run TASK_ID
@@ -200,6 +218,12 @@ PYTHONPYCACHEPREFIX=/tmp/agent-relay-pycache python -m unittest discover -v
   the same shell. A Windows-side installation is not sufficient.
 - **Browser login does not return:** copy the displayed authentication URL into your
   Windows browser, finish login, then return to the WSL terminal.
+- **Copilot authentication or policy failure:** run `copilot login`, then start
+  `copilot` and use `/user` to verify the account. Organization-provided Copilot also
+  requires its administrator to enable the Copilot CLI policy.
+- **Student benefit is missing:** GitHub Education approval and Copilot Student
+  activation are separate. Revisit the Education benefits page; do not buy a plan
+  solely to work around a benefit that is still being applied.
 - **Root rejected:** use the exact Linux path from `git rev-parse --show-toplevel`,
   never a `C:\...` path.
 - **Claude rejects `--restricted`:** upgrade Claude Code to 2.1.248 or newer; never
