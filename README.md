@@ -30,7 +30,7 @@ The MVP answers one question: **can a user register arbitrary agents and move a 
 - Opt a reviewed Codex CLI or Codex App Server write preset into one exact task and Git root.
 - Snapshot Git state before and after a write, then require explicit change acceptance or verified rollback.
 - Keep every write-capable agent out of automatic fallback routes.
-- Persist local state atomically with owner-only permissions where the filesystem supports them, without following managed-path symlinks.
+- Persist local state atomically with owner-only permissions where the filesystem supports them, without following managed-path symlinks or losing concurrent updates.
 
 Agent Relay does not claim to transfer a model's hidden reasoning or private session. It transfers an auditable set of facts about the task.
 
@@ -113,6 +113,8 @@ The example flag is illustrative; use the non-interactive invocation supported b
 Custom adapters still run with the user's operating-system permissions and can access the selected working directory. Relay coordinates agents; it is not itself an operating-system sandbox. The reviewed Codex presets additionally request Codex's own read-only or workspace-write sandbox. Captured stdout and stderr are bounded and returned to the invoking user, but are not added to the checkpoint ledger.
 
 The state store canonicalizes parent components but requires the selected state root itself, its managed `tasks` directory, and every managed JSON file to be real directories or regular files rather than symlinks. It keeps directory identities for the lifetime of the process and performs reads, temporary-file creation, replacement, and cleanup relative to verified directory descriptors. If a managed directory is replaced or the platform cannot provide the required safe path operations, Relay fails closed instead of following the new path.
+
+Every task, agent-registry, and health-registry mutation holds an exclusive operating-system lock on the owner-only `.relay.lock` file for its complete read–modify–write transaction. Separate Relay CLI processes on the same local filesystem therefore cannot both accept the same task revision or overwrite independent registry changes. Read-only commands remain lock-free because state files are replaced atomically. The lock is advisory—other programs must not edit Relay state directly—and is released automatically if a process exits. Atomic replacement prevents a partially written JSON file from becoming current; an interrupted pre-replacement temporary file may remain but is ignored. Existing state directories create the lock file on first use without a schema migration.
 
 ## Built-in provider presets
 
@@ -413,7 +415,7 @@ The GitHub Actions workflow runs the same suite on Python 3.9 through 3.14 with 
 - Workspace review records content-free Git state metadata, not raw patch contents; the user must inspect the real Git diff before acceptance.
 - Structured result fields and reported tests remain agent claims; Relay does not independently execute tests.
 - Cooldown health is local JSON and shared across tasks that use the same agent ID; cross-machine health synchronization is not implemented yet.
-- State is local JSON and optimized for one writer. A service deployment will need transactional storage and stronger concurrency control.
+- State is local JSON with same-host process locking. A multi-host service deployment will still need a transactional storage backend and distributed concurrency control.
 - There is no HTTP API or graphical interface yet.
 
 Work is tracked in [GitHub Issues](https://github.com/Oussamoux1234/agent-relay/issues), with one scoped issue per milestone.

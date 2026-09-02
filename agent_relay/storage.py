@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import stat
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from .errors import ConflictError, NotFoundError, ValidationError
 from .health import AgentHealthRecord, HEALTH_SCHEMA_VERSION, MAX_HEALTH_RECORDS
@@ -16,6 +18,8 @@ from .models import AgentSpec, SCHEMA_VERSION, TaskCheckpoint, utc_now
 
 class RelayStore:
     """Stores user-owned agent definitions and checkpoints under one directory."""
+
+    _LOCK_FILENAME = ".relay.lock"
 
     def __init__(self, root: Path) -> None:
         requested_root = Path(root).expanduser()
@@ -28,6 +32,7 @@ class RelayStore:
         self.tasks_dir = self.root / "tasks"
         self._root_identity = self._ensure_private_directory(self.root)
         self._tasks_identity = self._ensure_private_child_directory("tasks")
+        self._lock_identity = self._ensure_transaction_lock()
 
     @staticmethod
     def _directory_flags() -> int:
@@ -146,6 +151,45 @@ class RelayStore:
         finally:
             os.close(parent_descriptor)
 
+    def _ensure_transaction_lock(self) -> Tuple[int, int]:
+        """Create or validate the stable inode used for local process locking."""
+
+        parent_descriptor = self._open_root_directory()
+        descriptor = None
+        try:
+            flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            try:
+                descriptor = os.open(
+                    self._LOCK_FILENAME,
+                    flags | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=parent_descriptor,
+                )
+            except FileExistsError:
+                descriptor = os.open(
+                    self._LOCK_FILENAME,
+                    flags,
+                    dir_fd=parent_descriptor,
+                )
+            opened = os.fstat(descriptor)
+            metadata = self._file_metadata(parent_descriptor, self._LOCK_FILENAME)
+            if (
+                metadata is None
+                or opened.st_dev != metadata.st_dev
+                or opened.st_ino != metadata.st_ino
+            ):
+                raise ValidationError("state lock changed during validation")
+            return opened.st_dev, opened.st_ino
+        except ValidationError:
+            raise
+        except OSError as exc:
+            raise ValidationError("could not create state lock") from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(parent_descriptor)
+
     def _open_parent(self, path: Path) -> int:
         if path.parent == self.root:
             return self._open_root_directory()
@@ -170,6 +214,61 @@ class RelayStore:
         try:
             return self._file_metadata(parent_descriptor, path.name) is not None
         finally:
+            os.close(parent_descriptor)
+
+    @contextmanager
+    def _exclusive_transaction(self) -> Iterator[None]:
+        """Serialize one complete read-modify-write state transaction."""
+
+        parent_descriptor = self._open_root_directory()
+        descriptor = None
+        locked = False
+        try:
+            flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            try:
+                descriptor = os.open(
+                    self._LOCK_FILENAME,
+                    flags,
+                    dir_fd=parent_descriptor,
+                )
+                opened = os.fstat(descriptor)
+            except OSError as exc:
+                raise ValidationError("could not open state lock") from exc
+            metadata = self._file_metadata(parent_descriptor, self._LOCK_FILENAME)
+            if (
+                metadata is None
+                or opened.st_dev != metadata.st_dev
+                or opened.st_ino != metadata.st_ino
+                or self._lock_identity != (opened.st_dev, opened.st_ino)
+            ):
+                raise ValidationError("state lock changed during validation")
+            while True:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                    break
+                except InterruptedError:
+                    continue
+                except OSError as exc:
+                    raise ValidationError("could not acquire state lock") from exc
+            locked = True
+            metadata = self._file_metadata(parent_descriptor, self._LOCK_FILENAME)
+            if (
+                metadata is None
+                or opened.st_dev != metadata.st_dev
+                or opened.st_ino != metadata.st_ino
+                or self._lock_identity != (opened.st_dev, opened.st_ino)
+            ):
+                raise ValidationError("state lock was replaced while waiting")
+            yield
+        finally:
+            if locked and descriptor is not None:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            if descriptor is not None:
+                os.close(descriptor)
             os.close(parent_descriptor)
 
     def _read_json(self, path: Path) -> Dict[str, Any]:
@@ -259,12 +358,13 @@ class RelayStore:
         return registry
 
     def register_agent(self, spec: AgentSpec, replace: bool = False) -> AgentSpec:
-        registry = self._read_registry()
-        agents = registry["agents"]
-        if spec.agent_id in agents and not replace:
-            raise ConflictError("agent already exists; pass --replace to update it")
-        agents[spec.agent_id] = spec.to_dict()
-        self._atomic_write(self.registry_path, registry)
+        with self._exclusive_transaction():
+            registry = self._read_registry()
+            agents = registry["agents"]
+            if spec.agent_id in agents and not replace:
+                raise ConflictError("agent already exists; pass --replace to update it")
+            agents[spec.agent_id] = spec.to_dict()
+            self._atomic_write(self.registry_path, registry)
         return spec
 
     def get_agent(self, agent_id: str) -> AgentSpec:
@@ -296,12 +396,13 @@ class RelayStore:
         return health
 
     def set_agent_health(self, record: AgentHealthRecord) -> AgentHealthRecord:
-        health = self._read_health()
-        agents = health["agents"]
-        if record.agent_id not in agents and len(agents) >= MAX_HEALTH_RECORDS:
-            raise ValidationError("health registry exceeds the maximum record count")
-        agents[record.agent_id] = record.to_dict()
-        self._atomic_write(self.health_path, health)
+        with self._exclusive_transaction():
+            health = self._read_health()
+            agents = health["agents"]
+            if record.agent_id not in agents and len(agents) >= MAX_HEALTH_RECORDS:
+                raise ValidationError("health registry exceeds the maximum record count")
+            agents[record.agent_id] = record.to_dict()
+            self._atomic_write(self.health_path, health)
         return record
 
     def get_agent_health(self, agent_id: str) -> Optional[AgentHealthRecord]:
@@ -318,12 +419,13 @@ class RelayStore:
         ]
 
     def clear_agent_health(self, agent_id: str) -> bool:
-        health = self._read_health()
-        if agent_id not in health["agents"]:
-            return False
-        del health["agents"][agent_id]
-        self._atomic_write(self.health_path, health)
-        return True
+        with self._exclusive_transaction():
+            health = self._read_health()
+            if agent_id not in health["agents"]:
+                return False
+            del health["agents"][agent_id]
+            self._atomic_write(self.health_path, health)
+            return True
 
     def _task_path(self, task_id: str) -> Path:
         if not isinstance(task_id, str) or not task_id or not task_id.isalnum() or len(task_id) > 64:
@@ -332,9 +434,10 @@ class RelayStore:
 
     def create_task(self, checkpoint: TaskCheckpoint) -> TaskCheckpoint:
         path = self._task_path(checkpoint.task_id)
-        if self._state_file_exists(path):
-            raise ConflictError("task already exists: %s" % checkpoint.task_id)
-        self._atomic_write(path, checkpoint.to_dict())
+        with self._exclusive_transaction():
+            if self._state_file_exists(path):
+                raise ConflictError("task already exists: %s" % checkpoint.task_id)
+            self._atomic_write(path, checkpoint.to_dict())
         return checkpoint
 
     def get_task(self, task_id: str) -> TaskCheckpoint:
@@ -345,15 +448,16 @@ class RelayStore:
 
     def save_task(self, checkpoint: TaskCheckpoint, expected_revision: int) -> TaskCheckpoint:
         path = self._task_path(checkpoint.task_id)
-        current = self.get_task(checkpoint.task_id)
-        if current.revision != expected_revision:
-            raise ConflictError(
-                "task changed concurrently: expected revision %d, found %d"
-                % (expected_revision, current.revision)
-            )
-        checkpoint.revision = expected_revision + 1
-        checkpoint.updated_at = utc_now()
-        self._atomic_write(path, checkpoint.to_dict())
+        with self._exclusive_transaction():
+            current = self.get_task(checkpoint.task_id)
+            if current.revision != expected_revision:
+                raise ConflictError(
+                    "task changed concurrently: expected revision %d, found %d"
+                    % (expected_revision, current.revision)
+                )
+            checkpoint.revision = expected_revision + 1
+            checkpoint.updated_at = utc_now()
+            self._atomic_write(path, checkpoint.to_dict())
         return checkpoint
 
     def list_tasks(self) -> List[TaskCheckpoint]:
