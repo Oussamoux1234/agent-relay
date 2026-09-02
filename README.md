@@ -27,6 +27,9 @@ The MVP answers one question: **can a user register arbitrary agents and move a 
 - Fail closed on authentication, timeout, overload, and unrecognized routed failures.
 - Extract bounded structured-result proposals from successful routed agents.
 - Preview proposed memory changes and accept them only with an unchanged checkpoint revision.
+- Opt a reviewed Codex CLI or Codex App Server write preset into one exact task and Git root.
+- Snapshot Git state before and after a write, then require explicit change acceptance or verified rollback.
+- Keep every write-capable agent out of automatic fallback routes.
 - Persist local state atomically with owner-only permissions where the filesystem supports them.
 
 Agent Relay does not claim to transfer a model's hidden reasoning or private session. It transfers an auditable set of facts about the task.
@@ -45,6 +48,8 @@ User ──> Relay service contract ──┼─ Claude Code adapter
               ├─ ordered fallback policy
               ├─ per-instance health + cooldown registry
               ├─ structured-result proposal
+              ├─ task/agent/root write authorization
+              ├─ bounded Git snapshots + review gate
               └─ action ledger + redacted failure class/digest
 ```
 
@@ -105,7 +110,7 @@ python3 -m agent_relay agent add my-agent \
 
 The example flag is illustrative; use the non-interactive invocation supported by the locally installed agent. Environment values are never stored. Only base process variables and explicitly allowed names are passed to the child.
 
-Adapters still run with the user's operating-system permissions and can access the selected working directory. Relay coordinates agents; it is not an operating-system sandbox. Captured stdout and stderr are bounded and returned to the invoking user, but are not added to the checkpoint ledger.
+Custom adapters still run with the user's operating-system permissions and can access the selected working directory. Relay coordinates agents; it is not itself an operating-system sandbox. The reviewed Codex presets additionally request Codex's own read-only or workspace-write sandbox. Captured stdout and stderr are bounded and returned to the invoking user, but are not added to the checkpoint ledger.
 
 ## Built-in provider presets
 
@@ -115,12 +120,14 @@ Check which supported CLIs are installed without launching a model request:
 python3 -m agent_relay agent presets
 ```
 
-The current presets are deliberately analysis-only:
+Read-only planning remains the default. Two separately named Codex presets expose the opt-in write policy:
 
 | Preset | Executable | Restricted mode |
 | --- | --- | --- |
 | `codex-cli` | `codex` | ephemeral `exec` with a read-only sandbox |
 | `codex-app-server` | `codex` | one App Server turn with a read-only sandbox and no approvals |
+| `codex-cli-write` | `codex` | ephemeral `exec`, workspace-write sandbox, on-request escalation policy |
+| `codex-app-server-write` | `codex` | one App Server turn, one writable root, no network or temporary-directory writes |
 | `claude-code` | `claude` | non-interactive plan mode |
 | `gemini-cli` | `gemini` | headless plan approval mode |
 | `antigravity-cli` | `agy` | plan mode with JSON-lines stdin |
@@ -136,14 +143,15 @@ python3 -m agent_relay agent add-preset gemini-cli
 python3 -m agent_relay agent add-preset antigravity-cli
 ```
 
-Every active preset follows the same baseline:
+Every preset follows the same baseline:
 
 - The portable checkpoint travels over stdin and is never interpolated into a shell command.
-- The provider is placed in its documented read-only or planning mode.
+- Read presets use the provider's documented read-only or planning mode.
+- Write access requires a separately registered built-in write preset plus a task-specific authorization.
 - Relay reuses the CLI's local authentication and never stores provider tokens.
 - Dangerous auto-approval and permission-bypass flags are not enabled.
 
-This first profile proves memory continuity without authorizing file changes. A workspace-write profile should be added later as a separate, explicit policy instead of silently broadening these presets. Provider behavior is based on the official [Codex non-interactive guide](https://developers.openai.com/codex/noninteractive), [Claude Code CLI reference](https://code.claude.com/docs/en/cli-usage), [Gemini CLI headless guide](https://geminicli.com/docs/cli/headless/), and [Antigravity headless guide](https://antigravity.google/docs/cli/headless/).
+Existing read registrations are never upgraded to write access. Codex write behavior follows OpenAI's documented [sandbox and approval model](https://learn.chatgpt.com/codex/sandboxing) and [writable-root permissions](https://learn.chatgpt.com/codex/permissions). Other provider behavior is based on the official [Codex non-interactive guide](https://developers.openai.com/codex/noninteractive), [Claude Code CLI reference](https://code.claude.com/docs/en/cli-usage), [Gemini CLI headless guide](https://geminicli.com/docs/cli/headless/), and [Antigravity headless guide](https://antigravity.google/docs/cli/headless/).
 
 ### Codex App support
 
@@ -181,6 +189,68 @@ The current safety boundary is intentional:
 This is a supported protocol integration, not desktop UI automation. Relay does not click or scrape the Codex app, discover private tasks, attach to a currently running UI process, or impersonate a browser session. It starts a local App Server process and can resume only a thread ID available to that configured Codex installation. App Server handoffs are manual and are not included in automatic quota routing yet.
 
 GitHub Copilot remains available as a parked preset for the later GitHub Education phase; it is not part of the current connector rollout.
+
+### Explicit workspace-write flow
+
+Workspace writes use two independent keys: the agent registration must come from a reviewed write preset, and the task ledger must authorize that exact agent ID for one canonical Git root. Register a write agent without changing any existing read agent:
+
+```bash
+python3 -m agent_relay agent add-preset codex-cli-write --id codex-writer
+# App Server is also supported:
+python3 -m agent_relay agent add-preset codex-app-server-write --id codex-app-writer
+```
+
+Authorize only the agent and repository needed for the task:
+
+```bash
+python3 -m agent_relay workspace authorize TASK_ID codex-writer \
+  --root /absolute/path/to/repository
+```
+
+Authorization fails unless the path is the exact top level of an existing Git repository. It is recorded as a `workspace-write-authorize` action scoped to the task, agent ID, and canonical root. It does not authorize a different task, a second Codex registration, a subdirectory, or another repository.
+
+Preview and execute the handoff normally, using that same root as the working directory:
+
+```bash
+python3 -m agent_relay handoff TASK_ID codex-writer
+python3 -m agent_relay handoff TASK_ID codex-writer \
+  --execute --cwd /absolute/path/to/repository
+```
+
+Relay records a bounded snapshot before launch and another after the process returns. The review contains SHA-256 state digests, HEAD and branch changes, pre-existing dirty paths, introduced/modified/removed paths, and final dirty paths. Tracked, staged, untracked, and ignored paths are covered; file contents and raw diffs are never copied into Relay state. Inspection is limited to 2,000 relevant paths, 128 MiB per file, and 512 MiB total so an unbounded repository fails before execution or blocks safely after execution.
+
+If a successful run changed the snapshot, the task stays blocked. Ask Relay for the review metadata, then inspect the actual repository diff with Git:
+
+```bash
+python3 -m agent_relay workspace review TASK_ID WRITE_ACTION_ID
+git status --short
+git diff
+git diff --cached
+```
+
+Accept only the exact snapshot you inspected. Both the checkpoint revision and current workspace digest must still match:
+
+```bash
+python3 -m agent_relay workspace accept TASK_ID WRITE_ACTION_ID \
+  --expected-revision CHECKPOINT_REVISION \
+  --cwd /absolute/path/to/repository
+```
+
+If the run timed out, exited non-zero, lost protocol state, or could not be inspected afterward, its effects are ambiguous and the action always stays blocked. `resolve` cannot override a write-capable action. Restore only this action's changes without discarding pre-existing work, then let Relay verify that the complete pre-run snapshot is back:
+
+```bash
+python3 -m agent_relay workspace verify-rollback TASK_ID WRITE_ACTION_ID \
+  --expected-revision CHECKPOINT_REVISION \
+  --cwd /absolute/path/to/repository
+```
+
+Relay supplies rollback guidance but never deletes files, resets Git history, or performs rollback itself. You can revoke future use of the grant after all write reviews are resolved:
+
+```bash
+python3 -m agent_relay workspace revoke TASK_ID codex-writer
+```
+
+The Codex CLI write preset ignores user configuration and execution rules, requests `workspace-write` with `on-request` escalation, disables command network access, and excludes both temporary-directory roots. The App Server write preset sends the same one-root, no-network, no-temp boundary in every turn. Relay declines App Server requests that cross the approved boundary. Write presets are never accepted in `route set`, so quota fallback remains read-only and an uncertain write can never trigger another agent automatically.
 
 ### Multiple Codex or Claude instances
 
@@ -274,7 +344,7 @@ Failure attempts persist only classifications and execution metadata. Successful
 
 ## Review and accept fresh agent memory
 
-Every executed route and Codex App handoff asks the successful agent to finish with a marked JSON result envelope containing only these fields:
+Every executed route, Codex App handoff, and workspace-write action asks the successful agent to finish with a marked JSON result envelope containing only these fields:
 
 - `summary`
 - `decisions`
@@ -298,7 +368,7 @@ python3 -m agent_relay result accept TASK_ID ACTION_ID \
   --expected-revision CHECKPOINT_REVISION
 ```
 
-Acceptance fails if the checkpoint changed after preview, an unresolved action exists, or a later agent execution made the proposal stale. Missing markers, malformed JSON, unknown fields, wrong task/action IDs, ambiguous envelopes, and oversized content never modify task memory. Pending proposals are redacted from later agent prompts; after acceptance, the proposal is removed from the action details and replaced by a SHA-256 digest plus field counts.
+Acceptance fails if the checkpoint changed after preview, an unresolved action exists, a workspace-write review is pending, or a later agent execution made the proposal stale. Missing markers, malformed JSON, unknown fields, wrong task/action IDs, ambiguous envelopes, and oversized content never modify task memory. Pending proposals are redacted from later agent prompts; after acceptance, the proposal is removed from the action details and replaced by a SHA-256 digest plus field counts.
 
 This is explicit, reviewable memory—not independent verification of an agent's claims. Relay does not automatically run reported tests or trust reported files. Provider response handling follows the official [Claude headless output](https://code.claude.com/docs/en/headless), [Gemini automation](https://geminicli.com/docs/cli/tutorials/automation/), and [Antigravity streaming JSON](https://antigravity.google/docs/cli/headless/) formats.
 
@@ -313,12 +383,14 @@ python3 -m agent_relay --state-dir .demo-relay task note TASK_ID \
   --next "Add logout"
 ```
 
-If a target process times out or exits non-zero, inspect the workspace and then resolve the ledger entry explicitly:
+If a read-only target process times out or exits non-zero, inspect the workspace and then resolve the ledger entry explicitly:
 
 ```bash
 python3 -m agent_relay --state-dir .demo-relay resolve TASK_ID ACTION_ID --as completed
 # or: --as failed / --as cancelled
 ```
+
+Write-capable actions cannot use this manual override; use `workspace accept` after a successful reviewed change or `workspace verify-rollback` after restoring an ambiguous run.
 
 ## Run tests
 
@@ -332,9 +404,10 @@ The GitHub Actions workflow runs the same suite on Python 3.9 through 3.14 with 
 
 - Manual handoffs, including Codex App Server turns, remain user-confirmed; ordered CLI routes can automatically continue only after conservative limit classification.
 - The adapter launches CLI processes but does not scrape or impersonate consumer subscriptions.
-- All built-in provider presets are read-only or plan-only; a workspace-write profile is not enabled yet.
+- Read-only or plan-only presets remain the default; write access currently supports only the separately named Codex CLI and Codex App Server write presets.
 - Codex App integration is limited to documented local App Server stdio calls; live desktop UI control, task discovery, WebSocket transport, and automatic app routing are not implemented.
-- Structured result fields are agent-reported and user-approved; automatic filesystem diff and test verification is not implemented yet.
+- Workspace review records content-free Git state metadata, not raw patch contents; the user must inspect the real Git diff before acceptance.
+- Structured result fields and reported tests remain agent claims; Relay does not independently execute tests.
 - Cooldown health is local JSON and shared across tasks that use the same agent ID; cross-machine health synchronization is not implemented yet.
 - State is local JSON and optimized for one writer. A service deployment will need transactional storage and stronger concurrency control.
 - There is no HTTP API or graphical interface yet.
@@ -347,4 +420,4 @@ Agent Relay is licensed under the [Apache License 2.0](LICENSE).
 
 ## Next milestone
 
-[Add explicitly approved workspace-write profiles](https://github.com/Oussamoux1234/agent-relay/issues/8) while preserving read-only routing as the default. GitHub Education/Copilot support remains a separate later milestone.
+[Extend approved workspace-write profiles beyond Codex](https://github.com/Oussamoux1234/agent-relay/issues/9), one provider at a time and only after verifying a bounded official mode. [GitHub Education/Copilot support](https://github.com/Oussamoux1234/agent-relay/issues/7) remains a separate later milestone.

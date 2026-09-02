@@ -21,6 +21,7 @@ ACTION_STATUSES = {"pending", "completed", "failed", "unknown", "cancelled"}
 TASK_STATUSES = {"active", "blocked", "completed"}
 PROMPT_TRANSPORTS = {"stdin", "argument"}
 CONFIG_HOME_ENVIRONMENTS = {"CLAUDE_CONFIG_DIR", "CODEX_HOME"}
+PERMISSION_PROFILE_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 
 
 def utc_now() -> str:
@@ -62,6 +63,7 @@ class AgentSpec:
     adapter_type: str = "cli"
     config_home: Optional[Tuple[str, str]] = None
     provider_id: Optional[str] = None
+    permission_profile: str = "read-only"
 
     def __post_init__(self) -> None:
         if not isinstance(self.agent_id, str) or AGENT_ID_PATTERN.fullmatch(self.agent_id) is None:
@@ -115,6 +117,11 @@ class AgentSpec:
                 or AGENT_ID_PATTERN.fullmatch(self.provider_id) is None
             ):
                 raise ValidationError("provider_id must be a lowercase identifier")
+        if (
+            not isinstance(self.permission_profile, str)
+            or PERMISSION_PROFILE_PATTERN.fullmatch(self.permission_profile) is None
+        ):
+            raise ValidationError("permission_profile must be a lowercase identifier")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -135,6 +142,7 @@ class AgentSpec:
                 else None
             ),
             "provider_id": self.provider_id,
+            "permission_profile": self.permission_profile,
         }
 
     @classmethod
@@ -171,6 +179,7 @@ class AgentSpec:
             env_allowlist=tuple(env_allowlist),
             config_home=config_home,
             provider_id=value.get("provider_id"),
+            permission_profile=value.get("permission_profile", "read-only"),
         )
 
 

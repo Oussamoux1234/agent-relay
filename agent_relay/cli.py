@@ -14,7 +14,13 @@ from .errors import RelayError, ValidationError
 from .health import AgentHealthRecord, utc_datetime_now
 from .models import AgentSpec
 from .presets import PRESETS, build_preset, list_preset_statuses
-from .service import HandoffOutcome, RelayService, ResultPreview, RouteOutcome
+from .service import (
+    HandoffOutcome,
+    RelayService,
+    ResultPreview,
+    RouteOutcome,
+    WorkspaceReviewOutcome,
+)
 from .storage import RelayStore
 
 
@@ -56,6 +62,11 @@ def _handoff_to_dict(outcome: HandoffOutcome, include_prompt: bool) -> Dict[str,
         value["result_error_code"] = outcome.result_error_code
         value["result_proposal"] = (
             outcome.result.to_dict() if outcome.result is not None else None
+        )
+        value["workspace_review"] = (
+            outcome.workspace_review.to_dict()
+            if outcome.workspace_review is not None
+            else None
         )
     return value
 
@@ -121,6 +132,17 @@ def _result_preview_to_dict(preview: ResultPreview) -> Dict[str, Any]:
         "source_agent": preview.source_agent,
         "proposal": preview.proposal.to_dict(),
         "changes": preview.changes,
+    }
+
+
+def _workspace_review_to_dict(outcome: WorkspaceReviewOutcome) -> Dict[str, Any]:
+    return {
+        "task_id": outcome.task.task_id,
+        "task_status": outcome.task.status,
+        "checkpoint_revision": outcome.task.revision,
+        "source_action_id": outcome.source_action_id,
+        "source_agent": outcome.source_agent,
+        "workspace_review": outcome.review.to_dict(),
     }
 
 
@@ -248,6 +270,50 @@ def build_parser() -> argparse.ArgumentParser:
     result_accept.add_argument("source_action_id")
     result_accept.add_argument("--expected-revision", type=int, required=True)
 
+    workspace = commands.add_parser(
+        "workspace",
+        help="authorize and review bounded workspace-write actions",
+    )
+    workspace_commands = workspace.add_subparsers(
+        dest="workspace_command",
+        required=True,
+    )
+    workspace_authorize = workspace_commands.add_parser(
+        "authorize",
+        help="authorize one reviewed write agent for one task and exact Git root",
+    )
+    workspace_authorize.add_argument("task_id")
+    workspace_authorize.add_argument("agent_id")
+    workspace_authorize.add_argument("--root", required=True)
+    workspace_revoke = workspace_commands.add_parser(
+        "revoke",
+        help="revoke one task/agent workspace-write authorization",
+    )
+    workspace_revoke.add_argument("task_id")
+    workspace_revoke.add_argument("agent_id")
+    workspace_review = workspace_commands.add_parser(
+        "review",
+        help="show the content-free change summary and rollback guidance",
+    )
+    workspace_review.add_argument("task_id")
+    workspace_review.add_argument("source_action_id")
+    workspace_accept = workspace_commands.add_parser(
+        "accept",
+        help="accept a reviewed write snapshot if it and the checkpoint are unchanged",
+    )
+    workspace_accept.add_argument("task_id")
+    workspace_accept.add_argument("source_action_id")
+    workspace_accept.add_argument("--expected-revision", type=int, required=True)
+    workspace_accept.add_argument("--cwd", default=".")
+    workspace_rollback = workspace_commands.add_parser(
+        "verify-rollback",
+        help="verify the pre-run snapshot was restored and unblock the task",
+    )
+    workspace_rollback.add_argument("task_id")
+    workspace_rollback.add_argument("source_action_id")
+    workspace_rollback.add_argument("--expected-revision", type=int, required=True)
+    workspace_rollback.add_argument("--cwd", default=".")
+
     health = commands.add_parser("health", help="inspect or clear provider cooldowns")
     health_commands = health.add_subparsers(dest="health_command", required=True)
     health_commands.add_parser("list", help="list persisted agent health records")
@@ -374,6 +440,46 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             args.task_id,
             args.source_action_id,
             args.expected_revision,
+        )
+        return {"task": checkpoint.to_dict()}
+    if args.command_name == "workspace" and args.workspace_command == "authorize":
+        checkpoint = service.authorize_workspace(
+            args.task_id,
+            args.agent_id,
+            Path(args.root),
+        )
+        return {
+            "task_id": checkpoint.task_id,
+            "task_status": checkpoint.status,
+            "revision": checkpoint.revision,
+            "authorization_action": checkpoint.actions[-1].to_dict(),
+        }
+    if args.command_name == "workspace" and args.workspace_command == "revoke":
+        checkpoint = service.revoke_workspace(args.task_id, args.agent_id)
+        return {
+            "task_id": checkpoint.task_id,
+            "task_status": checkpoint.status,
+            "revision": checkpoint.revision,
+            "revocation_action": checkpoint.actions[-1].to_dict(),
+        }
+    if args.command_name == "workspace" and args.workspace_command == "review":
+        return _workspace_review_to_dict(
+            service.inspect_workspace_review(args.task_id, args.source_action_id)
+        )
+    if args.command_name == "workspace" and args.workspace_command == "accept":
+        checkpoint = service.accept_workspace_review(
+            args.task_id,
+            args.source_action_id,
+            args.expected_revision,
+            Path(args.cwd),
+        )
+        return {"task": checkpoint.to_dict()}
+    if args.command_name == "workspace" and args.workspace_command == "verify-rollback":
+        checkpoint = service.verify_workspace_rollback(
+            args.task_id,
+            args.source_action_id,
+            args.expected_revision,
+            Path(args.cwd),
         )
         return {"task": checkpoint.to_dict()}
     if args.command_name == "health" and args.health_command == "list":

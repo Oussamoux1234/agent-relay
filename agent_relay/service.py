@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -35,6 +35,7 @@ from .models import (
 from .prompting import CheckpointPromptRenderer
 from .results import ResultExtraction, StructuredResultExtractor, result_digest
 from .storage import RelayStore
+from .workspace import WorkspaceInspector, WorkspaceReview
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,7 @@ class HandoffOutcome:
     result_status: str = "not-applicable"
     result: Optional[StructuredAgentResult] = None
     result_error_code: Optional[str] = None
+    workspace_review: Optional[WorkspaceReview] = None
 
 
 @dataclass(frozen=True)
@@ -97,8 +99,27 @@ class ResultPreview:
     changes: Dict[str, Any]
 
 
+@dataclass(frozen=True)
+class WorkspaceReviewOutcome:
+    """Review state for one explicitly authorized workspace-write action."""
+
+    task: TaskCheckpoint
+    source_action_id: str
+    source_agent: str
+    review: WorkspaceReview
+
+
 AUTO_ROUTE_PROVIDER_IDS = frozenset(
     ("antigravity-cli", "claude-code", "codex-cli", "gemini-cli")
+)
+WORKSPACE_WRITE_PROVIDER_IDS = frozenset(
+    ("codex-cli-write", "codex-app-server-write")
+)
+WORKSPACE_WRITE_ACTION_KINDS = frozenset(
+    ("workspace-write", "session-workspace-write")
+)
+RESULT_ACTION_KINDS = frozenset(
+    ("route-run", "session-turn", "workspace-write", "session-workspace-write")
 )
 
 
@@ -115,6 +136,7 @@ class RelayService:
         result_extractor: Optional[StructuredResultExtractor] = None,
         cooldown_policy: Optional[CooldownPolicy] = None,
         clock: Optional[Callable[[], datetime]] = None,
+        workspace_inspector: Optional[WorkspaceInspector] = None,
     ) -> None:
         self.store = store
         if adapter is not None and adapter_registry is not None:
@@ -133,6 +155,7 @@ class RelayService:
         self.result_extractor = result_extractor or StructuredResultExtractor()
         self.cooldown_policy = cooldown_policy or CooldownPolicy()
         self.clock = clock or utc_datetime_now
+        self.workspace_inspector = workspace_inspector or WorkspaceInspector()
 
     def register_agent(self, spec: AgentSpec, replace: bool = False) -> AgentSpec:
         self.adapters.get(spec.adapter_type)
@@ -180,12 +203,85 @@ class RelayService:
         checkpoint.state.__post_init__()
         return self.store.save_task(checkpoint, expected_revision)
 
+    def authorize_workspace(
+        self,
+        task_id: str,
+        agent_id: str,
+        workspace_root: Path,
+    ) -> TaskCheckpoint:
+        """Opt one reviewed write preset into one exact task and Git root."""
+
+        checkpoint = self.store.get_task(task_id)
+        if checkpoint.status == "completed":
+            raise ConflictError("completed tasks cannot authorize workspace writes")
+        self._assert_no_execution_gate(checkpoint, "authorizing workspace writes")
+        target = self._get_workspace_write_agent(agent_id)
+        root = self.workspace_inspector.validate_root(workspace_root)
+        current_root = self._active_workspace_authorization(checkpoint, agent_id)
+        if current_root is not None:
+            raise ConflictError(
+                "workspace write is already authorized for this task and agent; revoke it first"
+            )
+
+        expected_revision = checkpoint.revision
+        timestamp = utc_now()
+        checkpoint.actions.append(
+            ActionRecord(
+                action_id=uuid.uuid4().hex,
+                kind="workspace-write-authorize",
+                agent_id=target.agent_id,
+                status="completed",
+                started_at=timestamp,
+                finished_at=timestamp,
+                details={
+                    "workspace_root": str(root),
+                    "scope": "exact-task-agent-git-root",
+                },
+            )
+        )
+        checkpoint.__post_init__()
+        return self.store.save_task(checkpoint, expected_revision)
+
+    def revoke_workspace(self, task_id: str, agent_id: str) -> TaskCheckpoint:
+        """Revoke the latest active task/agent workspace-write authorization."""
+
+        checkpoint = self.store.get_task(task_id)
+        self._assert_no_execution_gate(checkpoint, "revoking workspace writes")
+        self._get_workspace_write_agent(agent_id)
+        workspace_root = self._active_workspace_authorization(checkpoint, agent_id)
+        if workspace_root is None:
+            raise ConflictError("workspace write is not authorized for this task and agent")
+
+        expected_revision = checkpoint.revision
+        timestamp = utc_now()
+        checkpoint.actions.append(
+            ActionRecord(
+                action_id=uuid.uuid4().hex,
+                kind="workspace-write-revoke",
+                agent_id=agent_id,
+                status="completed",
+                started_at=timestamp,
+                finished_at=timestamp,
+                details={
+                    "workspace_root": workspace_root,
+                    "scope": "exact-task-agent-git-root",
+                },
+            )
+        )
+        checkpoint.__post_init__()
+        return self.store.save_task(checkpoint, expected_revision)
+
     def preview_handoff(self, task_id: str, target_agent: str) -> HandoffOutcome:
         checkpoint = self.store.get_task(task_id)
         target = self.store.get_agent(target_agent)
         self.adapters.get(target.adapter_type)
         self._assert_handoff_allowed(checkpoint, target_agent)
-        prompt = self.renderer.render(checkpoint, target_agent)
+        workspace_root = self._workspace_root_for_target(checkpoint, target)
+        prompt = self.renderer.render(
+            checkpoint,
+            target_agent,
+            self._workspace_prompt_policy(workspace_root),
+        )
         return HandoffOutcome(task=checkpoint, prompt=prompt, dry_run=True)
 
     def handoff(
@@ -199,6 +295,8 @@ class RelayService:
         target = self.store.get_agent(target_agent)
         runtime_adapter = self.adapters.get(target.adapter_type)
         self._assert_handoff_allowed(checkpoint, target_agent)
+        workspace_root = self._workspace_root_for_target(checkpoint, target)
+        is_workspace_write = workspace_root is not None
 
         is_session_adapter = isinstance(runtime_adapter, SessionAgentAdapter)
         if session_id is not None and not is_session_adapter:
@@ -209,32 +307,77 @@ class RelayService:
             session_id = self._latest_external_session(checkpoint, target_agent)
 
         source_agent = checkpoint.active_agent
-        action_kind = "session-turn" if is_session_adapter else "handoff"
+        if is_workspace_write:
+            action_kind = (
+                "session-workspace-write" if is_session_adapter else "workspace-write"
+            )
+        else:
+            action_kind = "session-turn" if is_session_adapter else "handoff"
         action = ActionRecord(
             action_id=uuid.uuid4().hex,
             kind=action_kind,
             agent_id=target_agent,
             status="pending",
             started_at=utc_now(),
-            details={"source_agent": source_agent},
+            details={
+                "source_agent": source_agent,
+                **(
+                    {
+                        "workspace_root": workspace_root,
+                        "authorization": "exact-task-agent-git-root",
+                    }
+                    if workspace_root is not None
+                    else {}
+                ),
+            },
         )
         expected_revision = checkpoint.revision
         checkpoint.actions.append(action)
-        prompt = self.renderer.render(checkpoint, target_agent)
+        prompt = self.renderer.render(
+            checkpoint,
+            target_agent,
+            self._workspace_prompt_policy(workspace_root),
+        )
         working_directory = runtime_adapter.validate_execution(target, prompt, working_directory)
+        before_snapshot = None
+        if workspace_root is not None:
+            working_directory = self.workspace_inspector.validate_working_directory(
+                working_directory,
+                workspace_root,
+            )
+            before_snapshot = self.workspace_inspector.snapshot(working_directory)
+            action.details["workspace_preflight"] = {
+                "before_digest": before_snapshot.digest,
+                "before_head": before_snapshot.head,
+                "before_branch": before_snapshot.branch,
+                "preexisting_paths": list(before_snapshot.dirty_paths),
+            }
         checkpoint = self.store.save_task(checkpoint, expected_revision)
 
-        if is_session_adapter:
-            execution = runtime_adapter.execute_session(
-                target,
-                prompt,
-                working_directory,
-                session_id,
+        try:
+            if is_session_adapter:
+                execution = runtime_adapter.execute_session(
+                    target,
+                    prompt,
+                    working_directory,
+                    session_id,
+                )
+            else:
+                execution = runtime_adapter.execute(target, prompt, working_directory)
+        except Exception as exc:
+            # Once the pending action is durable, an adapter exception cannot prove that no
+            # external effect occurred. Preserve only the exception type and fail closed.
+            execution = AgentExecutionResult(
+                status="unknown",
+                return_code=None,
+                stdout="",
+                stderr="",
+                elapsed_ms=0,
+                started=True,
+                error="runtime adapter raised unexpectedly: %s" % type(exc).__name__,
             )
-        else:
-            execution = runtime_adapter.execute(target, prompt, working_directory)
         extraction = ResultExtraction("not-applicable")
-        if action_kind == "session-turn" and execution.status == "completed":
+        if action_kind in RESULT_ACTION_KINDS and execution.status == "completed":
             extraction = self.result_extractor.extract(
                 execution.stdout,
                 task_id,
@@ -263,7 +406,27 @@ class RelayService:
             persisted_action.details["protocol_status"] = execution.protocol_status
         if execution.event_types:
             persisted_action.details["protocol_event_types"] = list(execution.event_types)
-        if action_kind == "session-turn" and execution.status == "completed":
+        workspace_review = None
+        if before_snapshot is not None:
+            if not execution.started:
+                workspace_review = self.workspace_inspector.compare(
+                    before_snapshot,
+                    before_snapshot,
+                )
+            else:
+                try:
+                    after_snapshot = self.workspace_inspector.snapshot(working_directory)
+                    workspace_review = self.workspace_inspector.compare(
+                        before_snapshot,
+                        after_snapshot,
+                    )
+                except Exception:
+                    workspace_review = self.workspace_inspector.unavailable(
+                        before_snapshot,
+                        "post-run-workspace-inspection-failed",
+                    )
+            persisted_action.details["workspace_review"] = workspace_review.to_dict()
+        if action_kind in RESULT_ACTION_KINDS and execution.status == "completed":
             if extraction.status == "ready" and extraction.result is not None:
                 persisted_action.details.update(
                     {
@@ -279,10 +442,21 @@ class RelayService:
                         "result_error_code": extraction.error_code,
                     }
                 )
-        if execution.status == "completed":
+        if (
+            execution.status == "completed"
+            and workspace_review is not None
+            and workspace_review.status == "unavailable"
+        ):
+            persisted_action.status = "unknown"
+            checkpoint.status = "blocked"
+        elif execution.status == "completed":
             persisted_action.status = "completed"
             checkpoint.active_agent = target_agent
-            checkpoint.status = "active"
+            checkpoint.status = (
+                "blocked"
+                if workspace_review is not None and workspace_review.status == "pending"
+                else "active"
+            )
         elif execution.started:
             persisted_action.status = "unknown"
             checkpoint.status = "blocked"
@@ -299,6 +473,7 @@ class RelayService:
             result_status=("pending" if extraction.status == "ready" else extraction.status),
             result=extraction.result,
             result_error_code=extraction.error_code,
+            workspace_review=workspace_review,
         )
 
     def configure_route(self, task_id: str, routing_order: List[str]) -> TaskCheckpoint:
@@ -307,8 +482,7 @@ class RelayService:
         checkpoint = self.store.get_task(task_id)
         if checkpoint.status == "completed":
             raise ConflictError("completed tasks cannot be routed")
-        if checkpoint.unresolved_actions():
-            raise ConflictError("resolve the task's pending or unknown action before routing")
+        self._assert_no_execution_gate(checkpoint, "routing")
         if checkpoint.active_agent is None:
             raise ValidationError("task must have an active agent before routing")
         if not isinstance(routing_order, list) or len(routing_order) < 2:
@@ -376,8 +550,8 @@ class RelayService:
                 or checkpoint.active_agent != starting_agent
             ):
                 raise ConflictError("task route changed while fallback execution was in progress")
-            if checkpoint.unresolved_actions():
-                raise ConflictError("task gained an unresolved action during fallback execution")
+            if self._has_execution_gate(checkpoint):
+                raise ConflictError("task gained an execution gate during fallback execution")
             target = self._get_safe_routing_agent(agent_id)
             runtime_adapter = self.adapters.get(target.adapter_type)
             action = ActionRecord(
@@ -599,13 +773,14 @@ class RelayService:
                 "task has an unresolved action (%s); resolve it before accepting a result"
                 % unresolved[0].action_id
             )
+        self._assert_no_pending_workspace_review(checkpoint, "accepting a result")
 
         source_action, proposal = self._pending_result(checkpoint, source_action_id)
         source_index = checkpoint.actions.index(source_action)
         later_executions = [
             action
             for action in checkpoint.actions[source_index + 1 :]
-            if action.kind in {"handoff", "route-run", "session-turn"}
+            if action.kind in RESULT_ACTION_KINDS.union(("handoff",))
         ]
         if later_executions:
             raise ConflictError("result proposal is stale because a later agent action exists")
@@ -656,12 +831,143 @@ class RelayService:
         checkpoint.__post_init__()
         return self.store.save_task(checkpoint, expected_revision)
 
+    def inspect_workspace_review(
+        self,
+        task_id: str,
+        source_action_id: str,
+    ) -> WorkspaceReviewOutcome:
+        checkpoint = self.store.get_task(task_id)
+        source_action, review = self._workspace_review(checkpoint, source_action_id)
+        return WorkspaceReviewOutcome(
+            task=checkpoint,
+            source_action_id=source_action.action_id,
+            source_agent=source_action.agent_id,
+            review=review,
+        )
+
+    def accept_workspace_review(
+        self,
+        task_id: str,
+        source_action_id: str,
+        expected_revision: int,
+        working_directory: Path,
+    ) -> TaskCheckpoint:
+        """Accept an unchanged post-run snapshot after the user reviewed its diff."""
+
+        checkpoint = self._checkpoint_at_revision(task_id, expected_revision)
+        source_action, review = self._workspace_review(checkpoint, source_action_id)
+        if source_action.status != "completed":
+            raise ConflictError("only a completed write action can have its changes accepted")
+        if review.status != "pending" or review.after_digest is None:
+            raise ConflictError("workspace write action has no pending change review")
+        root = self.workspace_inspector.validate_working_directory(
+            working_directory,
+            review.workspace_root,
+        )
+        current = self.workspace_inspector.snapshot(root)
+        if current.digest != review.after_digest:
+            raise ConflictError(
+                "workspace changed after the recorded review; run the write or review flow again"
+            )
+
+        reviewed_at = utc_now()
+        acceptance_action_id = uuid.uuid4().hex
+        accepted_review = replace(review, status="accepted", reviewed_at=reviewed_at)
+        source_action.details["workspace_review"] = accepted_review.to_dict()
+        checkpoint.actions.append(
+            ActionRecord(
+                action_id=acceptance_action_id,
+                kind="workspace-write-accept",
+                agent_id=source_action.agent_id,
+                status="completed",
+                started_at=reviewed_at,
+                finished_at=reviewed_at,
+                details={
+                    "source_action_id": source_action.action_id,
+                    "workspace_root": review.workspace_root,
+                    "after_digest": review.after_digest,
+                },
+            )
+        )
+        checkpoint.status = "blocked" if self._has_execution_gate(checkpoint) else "active"
+        checkpoint.__post_init__()
+        return self.store.save_task(checkpoint, expected_revision)
+
+    def verify_workspace_rollback(
+        self,
+        task_id: str,
+        source_action_id: str,
+        expected_revision: int,
+        working_directory: Path,
+    ) -> TaskCheckpoint:
+        """Unblock only after the exact pre-run snapshot has been restored."""
+
+        checkpoint = self._checkpoint_at_revision(task_id, expected_revision)
+        source_action, review = self._workspace_review(checkpoint, source_action_id)
+        if review.status in {"accepted", "rolled-back"}:
+            raise ConflictError("workspace review is already resolved")
+        root = self.workspace_inspector.validate_working_directory(
+            working_directory,
+            review.workspace_root,
+        )
+        current = self.workspace_inspector.snapshot(root)
+        if current.digest != review.before_digest:
+            raise ConflictError(
+                "workspace does not match the pre-run snapshot; follow rollback guidance and retry"
+            )
+
+        reviewed_at = utc_now()
+        rollback_action_id = uuid.uuid4().hex
+        rolled_back_review = replace(
+            review,
+            status="rolled-back",
+            after_digest=current.digest,
+            after_head=current.head,
+            after_branch=current.branch,
+            final_dirty_paths=current.dirty_paths,
+            reviewed_at=reviewed_at,
+            error_code=None,
+        )
+        source_action.details["workspace_review"] = rolled_back_review.to_dict()
+        source_action.details.pop("result_proposal", None)
+        if source_action.details.get("result_status") == "pending":
+            source_action.details["result_status"] = "discarded-after-rollback"
+        if source_action.status in {"pending", "unknown"}:
+            source_action.status = "cancelled"
+            source_action.finished_at = reviewed_at
+            source_action.details["resolved_by"] = "verified-workspace-rollback"
+        source_agent = source_action.details.get("source_agent")
+        if isinstance(source_agent, str):
+            checkpoint.active_agent = source_agent
+        checkpoint.actions.append(
+            ActionRecord(
+                action_id=rollback_action_id,
+                kind="workspace-write-rollback-verified",
+                agent_id=source_action.agent_id,
+                status="completed",
+                started_at=reviewed_at,
+                finished_at=reviewed_at,
+                details={
+                    "source_action_id": source_action.action_id,
+                    "workspace_root": review.workspace_root,
+                    "restored_digest": current.digest,
+                },
+            )
+        )
+        checkpoint.status = "blocked" if self._has_execution_gate(checkpoint) else "active"
+        checkpoint.__post_init__()
+        return self.store.save_task(checkpoint, expected_revision)
+
     def resolve_action(self, task_id: str, action_id: str, resolution: str) -> TaskCheckpoint:
         if resolution not in {"completed", "failed", "cancelled"}:
             raise ValidationError("resolution must be completed, failed, or cancelled")
         checkpoint = self.store.get_task(task_id)
         expected_revision = checkpoint.revision
         action = self._find_action(checkpoint, action_id)
+        if action.kind in WORKSPACE_WRITE_ACTION_KINDS:
+            raise ConflictError(
+                "workspace-write actions require change acceptance or verified rollback"
+            )
         if action.status not in {"pending", "unknown"}:
             raise ConflictError("only pending or unknown actions can be resolved")
         action.status = resolution
@@ -673,7 +979,7 @@ class RelayService:
             "session-turn",
         }:
             checkpoint.active_agent = action.agent_id
-        checkpoint.status = "blocked" if checkpoint.unresolved_actions() else "active"
+        checkpoint.status = "blocked" if self._has_execution_gate(checkpoint) else "active"
         return self.store.save_task(checkpoint, expected_revision)
 
     @staticmethod
@@ -683,7 +989,7 @@ class RelayService:
     ) -> Optional[str]:
         for action in reversed(checkpoint.actions):
             if (
-                action.kind == "session-turn"
+                action.kind in {"session-turn", "session-workspace-write"}
                 and action.agent_id == target_agent
                 and action.status == "completed"
             ):
@@ -692,18 +998,16 @@ class RelayService:
                     return session_id
         return None
 
-    @staticmethod
-    def _assert_handoff_allowed(checkpoint: TaskCheckpoint, target_agent: str) -> None:
+    def _assert_handoff_allowed(
+        self,
+        checkpoint: TaskCheckpoint,
+        target_agent: str,
+    ) -> None:
         if checkpoint.status == "completed":
             raise ConflictError("completed tasks cannot be handed off")
         if checkpoint.active_agent == target_agent:
             raise ConflictError("target agent is already active")
-        unresolved = checkpoint.unresolved_actions()
-        if unresolved:
-            raise ConflictError(
-                "task has an unresolved action (%s); resolve it before another handoff"
-                % unresolved[0].action_id
-            )
+        self._assert_no_execution_gate(checkpoint, "another handoff")
 
     def _route_plan(
         self,
@@ -712,12 +1016,7 @@ class RelayService:
     ) -> Tuple[Tuple[str, ...], Tuple[AgentHealthRecord, ...]]:
         if checkpoint.status == "completed":
             raise ConflictError("completed tasks cannot be routed")
-        unresolved = checkpoint.unresolved_actions()
-        if unresolved:
-            raise ConflictError(
-                "task has an unresolved action (%s); resolve it before routing"
-                % unresolved[0].action_id
-            )
+        self._assert_no_execution_gate(checkpoint, "routing")
         if not checkpoint.routing_order:
             raise ValidationError("task has no route; configure one with route set")
         if checkpoint.active_agent not in checkpoint.routing_order:
@@ -762,6 +1061,160 @@ class RelayService:
             )
         return spec
 
+    def _get_workspace_write_agent(self, agent_id: str) -> AgentSpec:
+        spec = self.store.get_agent(agent_id)
+        self.adapters.get(spec.adapter_type)
+        if spec.provider_id not in WORKSPACE_WRITE_PROVIDER_IDS:
+            raise ValidationError(
+                "workspace writes require a supported built-in write preset: %s" % agent_id
+            )
+        if (
+            spec.capabilities != ("repo-read", "repo-write")
+            or spec.permission_profile != "workspace-write"
+        ):
+            raise ValidationError(
+                "workspace-write preset has an invalid capability contract: %s" % agent_id
+            )
+        return spec
+
+    def _workspace_root_for_target(
+        self,
+        checkpoint: TaskCheckpoint,
+        target: AgentSpec,
+    ) -> Optional[str]:
+        requests_write = (
+            target.permission_profile == "workspace-write"
+            or "repo-write" in target.capabilities
+        )
+        if not requests_write:
+            return None
+        self._get_workspace_write_agent(target.agent_id)
+        workspace_root = self._active_workspace_authorization(
+            checkpoint,
+            target.agent_id,
+        )
+        if workspace_root is None:
+            raise ConflictError(
+                "workspace write is not authorized for this task and agent; "
+                "run workspace authorize first"
+            )
+        return workspace_root
+
+    @staticmethod
+    def _active_workspace_authorization(
+        checkpoint: TaskCheckpoint,
+        agent_id: str,
+    ) -> Optional[str]:
+        for action in reversed(checkpoint.actions):
+            if action.agent_id != agent_id or action.status != "completed":
+                continue
+            if action.kind == "workspace-write-revoke":
+                return None
+            if action.kind == "workspace-write-authorize":
+                workspace_root = action.details.get("workspace_root")
+                if (
+                    not isinstance(workspace_root, str)
+                    or not Path(workspace_root).is_absolute()
+                ):
+                    raise ValidationError("workspace authorization has an invalid root")
+                return workspace_root
+        return None
+
+    @staticmethod
+    def _workspace_prompt_policy(workspace_root: Optional[str]) -> Optional[Dict[str, Any]]:
+        if workspace_root is None:
+            return None
+        return {
+            "mode": "workspace-write",
+            "workspace_root": workspace_root,
+            "authorization": "exact-task-agent-git-root",
+            "network_access": False,
+            "review_required": True,
+        }
+
+    @staticmethod
+    def _workspace_review(
+        checkpoint: TaskCheckpoint,
+        source_action_id: str,
+    ) -> Tuple[ActionRecord, WorkspaceReview]:
+        source_action = RelayService._find_action(checkpoint, source_action_id)
+        if source_action.kind not in WORKSPACE_WRITE_ACTION_KINDS:
+            raise ConflictError("workspace reviews require a workspace-write action")
+        review_value = source_action.details.get("workspace_review")
+        if not isinstance(review_value, dict):
+            raise ConflictError("workspace-write action has no recorded review")
+        return source_action, WorkspaceReview.from_dict(review_value)
+
+    @staticmethod
+    def _pending_workspace_reviews(
+        checkpoint: TaskCheckpoint,
+    ) -> Tuple[ActionRecord, ...]:
+        pending = []
+        for action in checkpoint.actions:
+            if action.kind not in WORKSPACE_WRITE_ACTION_KINDS:
+                continue
+            review_value = action.details.get("workspace_review")
+            if not isinstance(review_value, dict):
+                if action.status == "completed":
+                    raise ValidationError("completed workspace-write action has no review")
+                continue
+            review = WorkspaceReview.from_dict(review_value)
+            if review.status in {"pending", "unavailable"}:
+                pending.append(action)
+        return tuple(pending)
+
+    @classmethod
+    def _has_execution_gate(cls, checkpoint: TaskCheckpoint) -> bool:
+        return bool(
+            checkpoint.unresolved_actions() or cls._pending_workspace_reviews(checkpoint)
+        )
+
+    @classmethod
+    def _assert_no_pending_workspace_review(
+        cls,
+        checkpoint: TaskCheckpoint,
+        operation: str,
+    ) -> None:
+        pending = cls._pending_workspace_reviews(checkpoint)
+        if pending:
+            raise ConflictError(
+                "workspace write action %s requires review before %s"
+                % (pending[0].action_id, operation)
+            )
+
+    @classmethod
+    def _assert_no_execution_gate(
+        cls,
+        checkpoint: TaskCheckpoint,
+        operation: str,
+    ) -> None:
+        unresolved = checkpoint.unresolved_actions()
+        if unresolved:
+            raise ConflictError(
+                "task has an unresolved action (%s); resolve it before %s"
+                % (unresolved[0].action_id, operation)
+            )
+        cls._assert_no_pending_workspace_review(checkpoint, operation)
+
+    def _checkpoint_at_revision(
+        self,
+        task_id: str,
+        expected_revision: int,
+    ) -> TaskCheckpoint:
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 1
+        ):
+            raise ValidationError("expected_revision must be a positive integer")
+        checkpoint = self.store.get_task(task_id)
+        if checkpoint.revision != expected_revision:
+            raise ConflictError(
+                "checkpoint changed after review: expected revision %d, found %d"
+                % (expected_revision, checkpoint.revision)
+            )
+        return checkpoint
+
     @staticmethod
     def _pending_result(
         checkpoint: TaskCheckpoint,
@@ -769,11 +1222,11 @@ class RelayService:
     ) -> Tuple[ActionRecord, StructuredAgentResult]:
         source_action = RelayService._find_action(checkpoint, source_action_id)
         if (
-            source_action.kind not in {"route-run", "session-turn"}
+            source_action.kind not in RESULT_ACTION_KINDS
             or source_action.status != "completed"
         ):
             raise ConflictError(
-                "result proposals require a completed route-run or session action"
+                "result proposals require a completed result-capable agent action"
             )
         result_status = source_action.details.get("result_status")
         if result_status != "pending":

@@ -44,6 +44,26 @@ EXPECTED_ARGUMENTS = {
         "-",
     ),
     "codex-app-server": ("app-server", "--listen", "stdio://"),
+    "codex-app-server-write": ("app-server", "--listen", "stdio://"),
+    "codex-cli-write": (
+        "--ask-for-approval",
+        "on-request",
+        "-c",
+        "sandbox_workspace_write.exclude_slash_tmp=true",
+        "-c",
+        "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+        "-c",
+        "sandbox_workspace_write.network_access=false",
+        "exec",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--sandbox",
+        "workspace-write",
+        "--ephemeral",
+        "--color",
+        "never",
+        "-",
+    ),
     "gemini-cli": (
         "--approval-mode",
         "plan",
@@ -103,7 +123,7 @@ class ProviderPresetTestCase(unittest.TestCase):
             self.assertFalse(status["available"])
             self.assertIsNone(status["executable"])
 
-    def test_presets_have_reviewed_analysis_only_invocations(self) -> None:
+    def test_presets_have_reviewed_permission_bounded_invocations(self) -> None:
         for preset_id, expected_arguments in EXPECTED_ARGUMENTS.items():
             with self.subTest(preset_id=preset_id):
                 executable = self.make_fake_provider(preset_id)
@@ -115,7 +135,11 @@ class ProviderPresetTestCase(unittest.TestCase):
                     (str(executable.resolve()),) + expected_arguments,
                 )
                 self.assertEqual(spec.prompt_transport, "stdin")
-                self.assertEqual(spec.capabilities, ("repo-read",))
+                self.assertEqual(spec.capabilities, PRESETS[preset_id].capabilities)
+                self.assertEqual(
+                    spec.permission_profile,
+                    PRESETS[preset_id].permission_profile,
+                )
                 self.assertEqual(spec.provider_id, preset_id)
                 self.assertNotIn("bypassPermissions", spec.command)
                 self.assertNotIn("--yolo", spec.command)
@@ -130,7 +154,8 @@ class ProviderPresetTestCase(unittest.TestCase):
             )
         )
 
-        for preset_id in set(EXPECTED_ARGUMENTS).difference({"codex-app-server"}):
+        excluded = {"codex-app-server", "codex-app-server-write", "codex-cli-write"}
+        for preset_id in set(EXPECTED_ARGUMENTS).difference(excluded):
             with self.subTest(preset_id=preset_id):
                 executable = self.make_fake_provider(preset_id)
                 self.service.register_agent(
@@ -268,6 +293,7 @@ class ProviderPresetTestCase(unittest.TestCase):
         loaded = self.store.get_agent("legacy")
 
         self.assertEqual(loaded.adapter_type, "cli")
+        self.assertEqual(loaded.permission_profile, "read-only")
 
     def test_agent_spec_positional_contract_remains_compatible(self) -> None:
         spec = AgentSpec("legacy", "Legacy", ("legacy",), "argument", 30, (), ())

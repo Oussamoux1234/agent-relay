@@ -50,18 +50,32 @@ initialized = receive()
 assert initialized == {"method": "initialized"}
 thread_request = receive()
 assert thread_request["method"] in ("thread/start", "thread/resume")
-assert thread_request["params"]["approvalPolicy"] == "never"
-assert thread_request["params"]["sandbox"] == "read-only"
+workspace_write = mode == "workspace-write"
+expected_approval = "on-request" if workspace_write else "never"
+expected_sandbox = "workspace-write" if workspace_write else "read-only"
+assert thread_request["params"]["approvalPolicy"] == expected_approval
+assert thread_request["params"]["approvalsReviewer"] == "user"
+assert thread_request["params"]["sandbox"] == expected_sandbox
 thread_id = thread_request["params"].get("threadId", "thread-created")
 send({"id": thread_request["id"], "result": {"thread": {"id": thread_id}}})
 
 turn_request = receive()
 assert turn_request["method"] == "turn/start"
 assert turn_request["params"]["threadId"] == thread_id
-assert turn_request["params"]["approvalPolicy"] == "never"
-assert turn_request["params"]["sandboxPolicy"] == {
-    "type": "readOnly", "networkAccess": False
-}
+assert turn_request["params"]["approvalPolicy"] == expected_approval
+assert turn_request["params"]["approvalsReviewer"] == "user"
+if workspace_write:
+    assert turn_request["params"]["sandboxPolicy"] == {
+        "type": "workspaceWrite",
+        "writableRoots": [str(__import__("pathlib").Path.cwd())],
+        "networkAccess": False,
+        "excludeTmpdirEnvVar": True,
+        "excludeSlashTmp": True,
+    }
+else:
+    assert turn_request["params"]["sandboxPolicy"] == {
+        "type": "readOnly", "networkAccess": False
+    }
 prompt = turn_request["params"]["input"][0]["text"]
 payload = json.loads(prompt[prompt.index("{"):])
 contract = payload["handoff"]["result_contract"]
@@ -121,6 +135,7 @@ class CodexAppServerAdapterTestCase(unittest.TestCase):
         self.temporary.cleanup()
 
     def spec(self, mode: str = "success", timeout_seconds: int = 5) -> AgentSpec:
+        is_workspace_write = mode == "workspace-write"
         return AgentSpec(
             agent_id="codex-app",
             display_name="Codex App",
@@ -135,8 +150,13 @@ class CodexAppServerAdapterTestCase(unittest.TestCase):
             adapter_type="codex-app-server",
             prompt_transport="stdin",
             timeout_seconds=timeout_seconds,
-            capabilities=("repo-read",),
-            provider_id="codex-app-server",
+            capabilities=(
+                ("repo-read", "repo-write") if is_workspace_write else ("repo-read",)
+            ),
+            provider_id=(
+                "codex-app-server-write" if is_workspace_write else "codex-app-server"
+            ),
+            permission_profile=("workspace-write" if is_workspace_write else "read-only"),
         )
 
     @staticmethod
@@ -202,6 +222,22 @@ class CodexAppServerAdapterTestCase(unittest.TestCase):
         self.assertEqual(requests[2]["method"], "thread/resume")
         self.assertEqual(requests[2]["params"]["threadId"], "thread-existing")
         self.assertEqual(requests[-1]["result"]["decision"], "decline")
+
+    def test_workspace_write_uses_one_root_without_network_or_temp_access(self) -> None:
+        result = CodexAppServerAdapter().execute(
+            self.spec("workspace-write"),
+            self.prompt(),
+            self.root,
+        )
+
+        self.assertEqual(result.status, "completed")
+        requests = self.messages()
+        self.assertEqual(requests[2]["params"]["approvalPolicy"], "on-request")
+        policy = requests[3]["params"]["sandboxPolicy"]
+        self.assertEqual(policy["writableRoots"], [str(self.root.resolve())])
+        self.assertFalse(policy["networkAccess"])
+        self.assertTrue(policy["excludeTmpdirEnvVar"])
+        self.assertTrue(policy["excludeSlashTmp"])
 
     def test_timeout_malformed_protocol_and_failed_turn_are_unknown(self) -> None:
         timeout = CodexAppServerAdapter().execute(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any, Dict, Optional
 
 from .errors import ValidationError
 from .models import TaskCheckpoint
@@ -15,13 +16,24 @@ MAX_PROMPT_CHARACTERS = 200_000
 class CheckpointPromptRenderer:
     """Renders facts and action state without pretending to transfer hidden reasoning."""
 
-    def render(self, checkpoint: TaskCheckpoint, target_agent: str) -> str:
+    def render(
+        self,
+        checkpoint: TaskCheckpoint,
+        target_agent: str,
+        workspace_policy: Optional[Dict[str, Any]] = None,
+    ) -> str:
         pending_action = next(
             (
                 action
                 for action in reversed(checkpoint.actions)
                 if action.agent_id == target_agent
-                and action.kind in {"route-run", "session-turn"}
+                and action.kind
+                in {
+                    "route-run",
+                    "session-turn",
+                    "workspace-write",
+                    "session-workspace-write",
+                }
                 and action.status == "pending"
             ),
             None,
@@ -48,6 +60,16 @@ class CheckpointPromptRenderer:
             payload["handoff"]["result_contract"] = result_contract(
                 checkpoint.task_id,
                 pending_action.action_id,
+            )
+        if workspace_policy is not None:
+            payload["handoff"]["workspace_policy"] = dict(workspace_policy)
+            payload["handoff"]["rules"].extend(
+                [
+                    "Modify files only inside workspace_policy.workspace_root.",
+                    "Do not change Git history or repository metadata.",
+                    "Do not use network access; ask the user if external access is required.",
+                    "A post-run snapshot and explicit user review are required before more execution.",
+                ]
             )
         serialized = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False)
         prompt = (

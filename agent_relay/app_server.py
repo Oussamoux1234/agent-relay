@@ -55,9 +55,43 @@ class CodexAppServerAdapter:
         resolved = CliAgentAdapter.validate_execution(spec, prompt, working_directory)
         if spec.prompt_transport != "stdin":
             raise ValidationError("Codex App Server requires stdin protocol transport")
-        if spec.capabilities != ("repo-read",):
-            raise ValidationError("Codex App Server prototype requires repo-read capability")
+        is_read_only = (
+            spec.capabilities == ("repo-read",)
+            and spec.permission_profile != "workspace-write"
+        )
+        is_workspace_write = (
+            spec.capabilities == ("repo-read", "repo-write")
+            and spec.permission_profile == "workspace-write"
+        )
+        if not (is_read_only or is_workspace_write):
+            raise ValidationError("Codex App Server capability contract is invalid")
         return resolved
+
+    @staticmethod
+    def _execution_policy(
+        spec: AgentSpec,
+        working_directory: Path,
+    ) -> Tuple[str, str, Dict[str, Any]]:
+        if spec.permission_profile == "workspace-write":
+            return (
+                "on-request",
+                "workspace-write",
+                {
+                    "type": "workspaceWrite",
+                    "writableRoots": [str(working_directory)],
+                    "networkAccess": False,
+                    "excludeTmpdirEnvVar": True,
+                    "excludeSlashTmp": True,
+                },
+            )
+        return (
+            "never",
+            "read-only",
+            {
+                "type": "readOnly",
+                "networkAccess": False,
+            },
+        )
 
     @staticmethod
     def _send(process: subprocess.Popen, message: Dict[str, Any]) -> None:
@@ -231,6 +265,10 @@ class CodexAppServerAdapter:
         thread_id = session_id
         turn_id = None
         protocol_status = None
+        approval_policy, sandbox_mode, turn_sandbox_policy = self._execution_policy(
+            spec,
+            working_directory,
+        )
 
         with tempfile.TemporaryFile(mode="w+b") as stderr_file:
             try:
@@ -282,8 +320,9 @@ class CodexAppServerAdapter:
                     method = "thread/start"
                     params = {
                         "cwd": str(working_directory),
-                        "approvalPolicy": "never",
-                        "sandbox": "read-only",
+                        "approvalPolicy": approval_policy,
+                        "approvalsReviewer": "user",
+                        "sandbox": sandbox_mode,
                         "serviceName": "agent_relay",
                     }
                 else:
@@ -291,8 +330,9 @@ class CodexAppServerAdapter:
                     params = {
                         "threadId": thread_id,
                         "cwd": str(working_directory),
-                        "approvalPolicy": "never",
-                        "sandbox": "read-only",
+                        "approvalPolicy": approval_policy,
+                        "approvalsReviewer": "user",
+                        "sandbox": sandbox_mode,
                     }
                 self._send(process, {"id": request_id, "method": method, "params": params})
                 response = self._receive_until(
@@ -317,11 +357,9 @@ class CodexAppServerAdapter:
                             "threadId": thread_id,
                             "input": [{"type": "text", "text": prompt}],
                             "cwd": str(working_directory),
-                            "approvalPolicy": "never",
-                            "sandboxPolicy": {
-                                "type": "readOnly",
-                                "networkAccess": False,
-                            },
+                            "approvalPolicy": approval_policy,
+                            "approvalsReviewer": "user",
+                            "sandboxPolicy": turn_sandbox_policy,
                         },
                     },
                 )
