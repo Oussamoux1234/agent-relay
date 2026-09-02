@@ -10,7 +10,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Protocol, Tuple
+from typing import Dict, Optional, Protocol, Tuple, runtime_checkable
 
 from .errors import ConflictError, NotFoundError, ValidationError
 from .models import AgentSpec
@@ -33,6 +33,10 @@ class AgentExecutionResult:
     started: bool
     timed_out: bool = False
     error: Optional[str] = None
+    session_id: Optional[str] = None
+    turn_id: Optional[str] = None
+    protocol_status: Optional[str] = None
+    event_types: Tuple[str, ...] = ()
 
 
 class AgentAdapter(Protocol):
@@ -53,6 +57,23 @@ class AgentAdapter(Protocol):
         spec: AgentSpec,
         prompt: str,
         working_directory: Path,
+    ) -> AgentExecutionResult:
+        ...
+
+
+@runtime_checkable
+class SessionAgentAdapter(AgentAdapter, Protocol):
+    """Runtime contract for adapters that can resume an external conversation."""
+
+    def validate_session_id(self, session_id: Optional[str]) -> Optional[str]:
+        ...
+
+    def execute_session(
+        self,
+        spec: AgentSpec,
+        prompt: str,
+        working_directory: Path,
+        session_id: Optional[str],
     ) -> AgentExecutionResult:
         ...
 
@@ -104,13 +125,23 @@ class CliAgentAdapter:
 
     @staticmethod
     def _terminate_process_group(process: subprocess.Popen) -> None:
+        if process.poll() is not None:
+            return
         try:
             os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            process.wait()
+            return
+        try:
             process.wait(timeout=2)
-        except (ProcessLookupError, subprocess.TimeoutExpired):
+        except subprocess.TimeoutExpired:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
                 pass
 
     @staticmethod

@@ -43,6 +43,7 @@ EXPECTED_ARGUMENTS = {
         "never",
         "-",
     ),
+    "codex-app-server": ("app-server", "--listen", "stdio://"),
     "gemini-cli": (
         "--approval-mode",
         "plan",
@@ -129,7 +130,7 @@ class ProviderPresetTestCase(unittest.TestCase):
             )
         )
 
-        for preset_id in EXPECTED_ARGUMENTS:
+        for preset_id in set(EXPECTED_ARGUMENTS).difference({"codex-app-server"}):
             with self.subTest(preset_id=preset_id):
                 executable = self.make_fake_provider(preset_id)
                 self.service.register_agent(

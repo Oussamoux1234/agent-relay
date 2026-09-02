@@ -21,7 +21,7 @@ class CheckpointPromptRenderer:
                 action
                 for action in reversed(checkpoint.actions)
                 if action.agent_id == target_agent
-                and action.kind == "route-run"
+                and action.kind in {"route-run", "session-turn"}
                 and action.status == "pending"
             ),
             None,

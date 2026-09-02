@@ -3,19 +3,21 @@
 [![CI](https://github.com/Oussamoux1234/agent-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/Oussamoux1234/agent-relay/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
-Agent Relay is a local-first continuity layer for AI coding agents. It saves an explicit task checkpoint and hands that checkpoint to another user-owned runtime, such as a CLI agent, local script, or future API adapter.
+Agent Relay is a local-first continuity layer for AI coding agents. It saves an explicit task checkpoint and hands that checkpoint to another user-owned runtime, such as a CLI agent, local script, or Codex App Server.
 
 The MVP answers one question: **can a user register arbitrary agents and move a task between them without losing verified work state or blindly repeating uncertain actions?**
 
 ## What works now
 
 - Register any local executable as an agent adapter.
-- Register reviewed presets for Codex CLI, Claude Code, Gemini CLI, and Antigravity CLI.
+- Register reviewed presets for Codex CLI, Codex App Server, Claude Code, Gemini CLI, and Antigravity CLI.
 - Describe its fixed arguments, prompt transport, capabilities, timeout, and permitted environment-variable names.
 - Create a versioned, inspectable task checkpoint.
 - Record summaries, decisions, constraints, changed files, tests, and next steps.
 - Preview the exact prompt before a handoff.
 - Execute a handoff without invoking a shell.
+- Start or resume a Codex thread through the documented local App Server stdio protocol.
+- Return a Codex App answer while retaining only safe thread/turn metadata and an explicit result proposal.
 - Record every handoff as pending before the target process starts.
 - Mark manual-handoff timeouts and non-zero exits as `unknown` and block further handoffs until the user resolves the outcome.
 - Configure an ordered route across Codex, Claude, Gemini, and Antigravity preset instances.
@@ -36,6 +38,7 @@ Agent Relay does not claim to transfer a model's hidden reasoning or private ses
 User ──> Relay service contract ──┼─ Claude Code adapter
               │                   ├─ Gemini CLI adapter
               │                   ├─ Antigravity adapter
+              │                   ├─ Codex App Server adapter
               │                   └─ custom command adapter
               │
               ├─ versioned checkpoint
@@ -45,7 +48,7 @@ User ──> Relay service contract ──┼─ Claude Code adapter
               └─ action ledger + redacted failure class/digest
 ```
 
-`AgentSpec` identifies the runtime type, and `AdapterRegistry` resolves it to an implementation. `CliAgentAdapter` launches a configured argv list with `shell=False`. Future API and application-extension adapters can be added without changing checkpoint persistence or handoff policy.
+`AgentSpec` identifies the runtime type, and `AdapterRegistry` resolves it to an implementation. `CliAgentAdapter` launches a configured argv list with `shell=False`; `CodexAppServerAdapter` drives one bounded JSONL turn over stdio. Future API and application-extension adapters can be added without changing checkpoint persistence or handoff policy.
 
 ## Run the harmless demo
 
@@ -117,6 +120,7 @@ The current presets are deliberately analysis-only:
 | Preset | Executable | Restricted mode |
 | --- | --- | --- |
 | `codex-cli` | `codex` | ephemeral `exec` with a read-only sandbox |
+| `codex-app-server` | `codex` | one App Server turn with a read-only sandbox and no approvals |
 | `claude-code` | `claude` | non-interactive plan mode |
 | `gemini-cli` | `gemini` | headless plan approval mode |
 | `antigravity-cli` | `agy` | plan mode with JSON-lines stdin |
@@ -126,6 +130,7 @@ Install and authenticate a provider through its own official workflow, then regi
 
 ```bash
 python3 -m agent_relay agent add-preset codex-cli
+python3 -m agent_relay agent add-preset codex-app-server
 python3 -m agent_relay agent add-preset claude-code
 python3 -m agent_relay agent add-preset gemini-cli
 python3 -m agent_relay agent add-preset antigravity-cli
@@ -142,7 +147,38 @@ This first profile proves memory continuity without authorizing file changes. A 
 
 ### Codex App support
 
-Relay can invoke the locally installed Codex CLI as a separate headless process. It does not yet control a Codex desktop task or extract that task's private chat history. The explicit checkpoint is the shared memory layer between the app, CLI agents, and future API adapters.
+Relay has a prototype connector for OpenAI's documented [Codex App Server](https://developers.openai.com/codex/app-server) interface. The connector launches the local `codex app-server` process, performs the required `initialize` handshake, starts or resumes a thread, sends one explicit checkpoint in `turn/start`, and consumes item and turn completion notifications. It uses the documented stdio JSONL transport and stable protocol methods; it does not enable experimental WebSocket transport or capabilities. The Codex CLI currently still labels App Server tooling experimental, so keep the installed CLI current and treat this connector as a version-sensitive prototype.
+
+Register the connector after installing and authenticating Codex through OpenAI's workflow:
+
+```bash
+python3 -m agent_relay agent add-preset codex-app-server --id codex-app
+```
+
+Preview the checkpoint normally, then explicitly authorize one read-only turn:
+
+```bash
+python3 -m agent_relay handoff TASK_ID codex-app
+python3 -m agent_relay handoff TASK_ID codex-app --execute --cwd .
+```
+
+The first execution starts a thread. Relay returns its ID and records it as `external_session_id`; after the task moves to another agent, a later handoff back to the same registered app agent resumes that thread automatically. To attach a checkpoint to a known Codex thread on the first handoff, identify it explicitly:
+
+```bash
+python3 -m agent_relay handoff TASK_ID codex-app \
+  --execute --cwd . --thread-id CODEX_THREAD_ID
+```
+
+The current safety boundary is intentional:
+
+- `--execute` is the user's authorization for exactly one app-server turn.
+- The turn uses `approvalPolicy: never`, a read-only sandbox, and disabled network access.
+- If Codex requests a command or file-change approval anyway, Relay declines it. Other unsupported server requests fail closed.
+- Relay returns only completed `agentMessage` text. It ignores reasoning items and never imports private chat history, credentials, or hidden chain-of-thought.
+- The ledger stores the thread ID, turn ID, protocol status, event method names, timing, and a bounded structured checkpoint proposal—not the raw answer or event payloads.
+- Timeouts, malformed protocol messages, and failed/interrupted turns become `unknown` actions and block another handoff until the user resolves them.
+
+This is a supported protocol integration, not desktop UI automation. Relay does not click or scrape the Codex app, discover private tasks, attach to a currently running UI process, or impersonate a browser session. It starts a local App Server process and can resume only a thread ID available to that configured Codex installation. App Server handoffs are manual and are not included in automatic quota routing yet.
 
 GitHub Copilot remains available as a parked preset for the later GitHub Education phase; it is not part of the current connector rollout.
 
@@ -238,7 +274,7 @@ Failure attempts persist only classifications and execution metadata. Successful
 
 ## Review and accept fresh agent memory
 
-Every executed route now asks the successful agent to finish with a marked JSON result envelope containing only these fields:
+Every executed route and Codex App handoff asks the successful agent to finish with a marked JSON result envelope containing only these fields:
 
 - `summary`
 - `decisions`
@@ -294,10 +330,10 @@ The GitHub Actions workflow runs the same suite on Python 3.9 through 3.14 with 
 
 ## Deliberate MVP boundaries
 
-- Manual handoffs remain user-confirmed; ordered CLI routes can automatically continue only after conservative limit classification.
+- Manual handoffs, including Codex App Server turns, remain user-confirmed; ordered CLI routes can automatically continue only after conservative limit classification.
 - The adapter launches CLI processes but does not scrape or impersonate consumer subscriptions.
 - All built-in provider presets are read-only or plan-only; a workspace-write profile is not enabled yet.
-- Codex App task control is not implemented; the current Codex integration is CLI-based.
+- Codex App integration is limited to documented local App Server stdio calls; live desktop UI control, task discovery, WebSocket transport, and automatic app routing are not implemented.
 - Structured result fields are agent-reported and user-approved; automatic filesystem diff and test verification is not implemented yet.
 - Cooldown health is local JSON and shared across tasks that use the same agent ID; cross-machine health synchronization is not implemented yet.
 - State is local JSON and optimized for one writer. A service deployment will need transactional storage and stronger concurrency control.
@@ -311,4 +347,4 @@ Agent Relay is licensed under the [Apache License 2.0](LICENSE).
 
 ## Next milestone
 
-[Design the Codex App connector](https://github.com/Oussamoux1234/agent-relay/issues/6) around an official integration boundary while keeping the explicit checkpoint as shared memory. Explicitly approved workspace-write profiles and GitHub Education/Copilot support remain separate later milestones.
+[Add explicitly approved workspace-write profiles](https://github.com/Oussamoux1234/agent-relay/issues/8) while preserving read-only routing as the default. GitHub Education/Copilot support remains a separate later milestone.

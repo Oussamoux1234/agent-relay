@@ -89,6 +89,18 @@ PRESETS = {
         permission_profile="sandbox-read-only",
         config_home_environment="CODEX_HOME",
     ),
+    "codex-app-server": AgentPreset(
+        preset_id="codex-app-server",
+        default_agent_id="codex-app",
+        display_name="OpenAI Codex App Server",
+        executable_name="codex",
+        fixed_arguments=("app-server", "--listen", "stdio://"),
+        prompt_transport="stdin",
+        capabilities=("repo-read",),
+        permission_profile="app-server-read-only",
+        adapter_type="codex-app-server",
+        config_home_environment="CODEX_HOME",
+    ),
     "gemini-cli": AgentPreset(
         preset_id="gemini-cli",
         default_agent_id="gemini-cli",

@@ -13,7 +13,9 @@ from .adapters import (
     AgentExecutionResult,
     AntigravityCliAdapter,
     CliAgentAdapter,
+    SessionAgentAdapter,
 )
+from .app_server import CodexAppServerAdapter
 from .errors import ConflictError, NotFoundError, ValidationError
 from .failures import FailureClassification, FailureClassifier
 from .health import (
@@ -44,6 +46,9 @@ class HandoffOutcome:
     dry_run: bool
     action_id: Optional[str] = None
     execution: Optional[AgentExecutionResult] = None
+    result_status: str = "not-applicable"
+    result: Optional[StructuredAgentResult] = None
+    result_error_code: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -120,6 +125,7 @@ class RelayService:
             self.adapters.register(self.adapter)
             if adapter is None:
                 self.adapters.register(AntigravityCliAdapter())
+                self.adapters.register(CodexAppServerAdapter())
         else:
             self.adapter = None
         self.renderer = renderer or CheckpointPromptRenderer()
@@ -187,16 +193,26 @@ class RelayService:
         task_id: str,
         target_agent: str,
         working_directory: Path,
+        session_id: Optional[str] = None,
     ) -> HandoffOutcome:
         checkpoint = self.store.get_task(task_id)
         target = self.store.get_agent(target_agent)
         runtime_adapter = self.adapters.get(target.adapter_type)
         self._assert_handoff_allowed(checkpoint, target_agent)
 
+        is_session_adapter = isinstance(runtime_adapter, SessionAgentAdapter)
+        if session_id is not None and not is_session_adapter:
+            raise ValidationError("target adapter does not support resumable sessions")
+        if is_session_adapter:
+            session_id = runtime_adapter.validate_session_id(session_id)
+        if session_id is None and is_session_adapter:
+            session_id = self._latest_external_session(checkpoint, target_agent)
+
         source_agent = checkpoint.active_agent
+        action_kind = "session-turn" if is_session_adapter else "handoff"
         action = ActionRecord(
             action_id=uuid.uuid4().hex,
-            kind="handoff",
+            kind=action_kind,
             agent_id=target_agent,
             status="pending",
             started_at=utc_now(),
@@ -208,7 +224,22 @@ class RelayService:
         working_directory = runtime_adapter.validate_execution(target, prompt, working_directory)
         checkpoint = self.store.save_task(checkpoint, expected_revision)
 
-        execution = runtime_adapter.execute(target, prompt, working_directory)
+        if is_session_adapter:
+            execution = runtime_adapter.execute_session(
+                target,
+                prompt,
+                working_directory,
+                session_id,
+            )
+        else:
+            execution = runtime_adapter.execute(target, prompt, working_directory)
+        extraction = ResultExtraction("not-applicable")
+        if action_kind == "session-turn" and execution.status == "completed":
+            extraction = self.result_extractor.extract(
+                execution.stdout,
+                task_id,
+                action.action_id,
+            )
 
         # Reload before resolving so a concurrent note cannot be silently overwritten.
         checkpoint = self.store.get_task(task_id)
@@ -224,6 +255,30 @@ class RelayService:
                 "timed_out": execution.timed_out,
             }
         )
+        if execution.session_id is not None:
+            persisted_action.details["external_session_id"] = execution.session_id
+        if execution.turn_id is not None:
+            persisted_action.details["external_turn_id"] = execution.turn_id
+        if execution.protocol_status is not None:
+            persisted_action.details["protocol_status"] = execution.protocol_status
+        if execution.event_types:
+            persisted_action.details["protocol_event_types"] = list(execution.event_types)
+        if action_kind == "session-turn" and execution.status == "completed":
+            if extraction.status == "ready" and extraction.result is not None:
+                persisted_action.details.update(
+                    {
+                        "result_status": "pending",
+                        "result_digest": result_digest(extraction.result),
+                        "result_proposal": extraction.result.to_dict(),
+                    }
+                )
+            else:
+                persisted_action.details.update(
+                    {
+                        "result_status": extraction.status,
+                        "result_error_code": extraction.error_code,
+                    }
+                )
         if execution.status == "completed":
             persisted_action.status = "completed"
             checkpoint.active_agent = target_agent
@@ -241,6 +296,9 @@ class RelayService:
             dry_run=False,
             action_id=action.action_id,
             execution=execution,
+            result_status=("pending" if extraction.status == "ready" else extraction.status),
+            result=extraction.result,
+            result_error_code=extraction.error_code,
         )
 
     def configure_route(self, task_id: str, routing_order: List[str]) -> TaskCheckpoint:
@@ -547,7 +605,7 @@ class RelayService:
         later_executions = [
             action
             for action in checkpoint.actions[source_index + 1 :]
-            if action.kind in {"handoff", "route-run"}
+            if action.kind in {"handoff", "route-run", "session-turn"}
         ]
         if later_executions:
             raise ConflictError("result proposal is stale because a later agent action exists")
@@ -609,10 +667,30 @@ class RelayService:
         action.status = resolution
         action.finished_at = utc_now()
         action.details["resolved_manually"] = True
-        if resolution == "completed" and action.kind in {"handoff", "route-run"}:
+        if resolution == "completed" and action.kind in {
+            "handoff",
+            "route-run",
+            "session-turn",
+        }:
             checkpoint.active_agent = action.agent_id
         checkpoint.status = "blocked" if checkpoint.unresolved_actions() else "active"
         return self.store.save_task(checkpoint, expected_revision)
+
+    @staticmethod
+    def _latest_external_session(
+        checkpoint: TaskCheckpoint,
+        target_agent: str,
+    ) -> Optional[str]:
+        for action in reversed(checkpoint.actions):
+            if (
+                action.kind == "session-turn"
+                and action.agent_id == target_agent
+                and action.status == "completed"
+            ):
+                session_id = action.details.get("external_session_id")
+                if isinstance(session_id, str):
+                    return session_id
+        return None
 
     @staticmethod
     def _assert_handoff_allowed(checkpoint: TaskCheckpoint, target_agent: str) -> None:
@@ -690,8 +768,13 @@ class RelayService:
         source_action_id: str,
     ) -> Tuple[ActionRecord, StructuredAgentResult]:
         source_action = RelayService._find_action(checkpoint, source_action_id)
-        if source_action.kind != "route-run" or source_action.status != "completed":
-            raise ConflictError("result proposals require a completed route-run action")
+        if (
+            source_action.kind not in {"route-run", "session-turn"}
+            or source_action.status != "completed"
+        ):
+            raise ConflictError(
+                "result proposals require a completed route-run or session action"
+            )
         result_status = source_action.details.get("result_status")
         if result_status != "pending":
             raise ConflictError("action has no pending result proposal")

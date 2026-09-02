@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 
 from .adapters import AgentExecutionResult
-from .errors import RelayError
+from .errors import RelayError, ValidationError
 from .health import AgentHealthRecord, utc_datetime_now
 from .models import AgentSpec
 from .presets import PRESETS, build_preset, list_preset_statuses
@@ -52,6 +52,11 @@ def _handoff_to_dict(outcome: HandoffOutcome, include_prompt: bool) -> Dict[str,
         value["prompt"] = outcome.prompt
     if outcome.execution is not None:
         value["execution"] = _execution_to_dict(outcome.execution)
+        value["result_status"] = outcome.result_status
+        value["result_error_code"] = outcome.result_error_code
+        value["result_proposal"] = (
+            outcome.result.to_dict() if outcome.result is not None else None
+        )
     return value
 
 
@@ -65,6 +70,10 @@ def _execution_to_dict(execution: AgentExecutionResult) -> Dict[str, Any]:
         "error": execution.error,
         "stdout": execution.stdout,
         "stderr": execution.stderr,
+        "session_id": execution.session_id,
+        "turn_id": execution.turn_id,
+        "protocol_status": execution.protocol_status,
+        "event_types": list(execution.event_types),
     }
 
 
@@ -185,6 +194,11 @@ def build_parser() -> argparse.ArgumentParser:
     handoff.add_argument("--execute", action="store_true")
     handoff.add_argument("--cwd", default=".")
     handoff.add_argument(
+        "--thread-id",
+        dest="session_id",
+        help="Codex thread to resume; supported only by the Codex App Server adapter",
+    )
+    handoff.add_argument(
         "--show-prompt",
         action="store_true",
         help="include the full checkpoint prompt in executed handoff output",
@@ -302,11 +316,14 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         )
         return {"task": checkpoint.to_dict()}
     if args.command_name == "handoff":
+        if args.session_id is not None and not args.execute:
+            raise ValidationError("--thread-id requires --execute")
         if args.execute:
             outcome = service.handoff(
                 task_id=args.task_id,
                 target_agent=args.target_agent,
                 working_directory=Path(args.cwd),
+                session_id=args.session_id,
             )
             return _handoff_to_dict(outcome, include_prompt=args.show_prompt)
         outcome = service.preview_handoff(args.task_id, args.target_agent)
