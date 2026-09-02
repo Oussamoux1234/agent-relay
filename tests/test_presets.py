@@ -34,6 +34,24 @@ EXPECTED_ARGUMENTS = {
         "--output-format",
         "json",
     ),
+    "claude-code-write": (
+        "-p",
+        "Continue the task using the Agent Relay checkpoint provided on stdin. "
+        "Make only the requested repository changes inside the current workspace and "
+        "return the next response.",
+        "--safe-mode",
+        "--restricted",
+        "--permission-mode",
+        "acceptEdits",
+        "--tools",
+        "Read,Edit,Write,Glob,Grep",
+        "--disallowedTools",
+        "mcp__*",
+        "--disable-slash-commands",
+        "--no-session-persistence",
+        "--output-format",
+        "json",
+    ),
     "codex-cli": (
         "exec",
         "--sandbox",
@@ -145,6 +163,52 @@ class ProviderPresetTestCase(unittest.TestCase):
                 self.assertNotIn("--yolo", spec.command)
                 self.assertNotIn("--dangerously-skip-permissions", spec.command)
 
+    def test_claude_write_preset_is_restricted_to_repository_file_tools(self) -> None:
+        arguments = PRESETS["claude-code-write"].fixed_arguments
+        executable = self.make_fake_provider("claude-code-write")
+        config_home = self.root / "claude-write-config"
+        spec = build_preset(
+            "claude-code-write",
+            executable=str(executable),
+            config_home=str(config_home),
+        )
+
+        self.assertIn("--safe-mode", arguments)
+        self.assertIn("--restricted", arguments)
+        self.assertEqual(
+            arguments[arguments.index("--permission-mode") + 1],
+            "acceptEdits",
+        )
+        self.assertEqual(
+            arguments[arguments.index("--tools") + 1],
+            "Read,Edit,Write,Glob,Grep",
+        )
+        self.assertEqual(
+            arguments[arguments.index("--disallowedTools") + 1],
+            "mcp__*",
+        )
+        self.assertNotIn("Bash", arguments[arguments.index("--tools") + 1])
+        self.assertEqual(
+            spec.config_home,
+            ("CLAUDE_CONFIG_DIR", str(config_home.resolve())),
+        )
+
+    def test_existing_read_presets_remain_read_only(self) -> None:
+        for preset_id in (
+            "antigravity-cli",
+            "claude-code",
+            "codex-cli",
+            "codex-app-server",
+            "gemini-cli",
+            "github-copilot",
+        ):
+            with self.subTest(preset_id=preset_id):
+                self.assertEqual(PRESETS[preset_id].capabilities, ("repo-read",))
+                self.assertNotEqual(
+                    PRESETS[preset_id].permission_profile,
+                    "workspace-write",
+                )
+
     def test_provider_shaped_handoffs_complete_through_registry(self) -> None:
         self.service.register_agent(
             AgentSpec(
@@ -154,7 +218,12 @@ class ProviderPresetTestCase(unittest.TestCase):
             )
         )
 
-        excluded = {"codex-app-server", "codex-app-server-write", "codex-cli-write"}
+        excluded = {
+            preset_id
+            for preset_id, preset in PRESETS.items()
+            if preset.adapter_type == "codex-app-server"
+            or "repo-write" in preset.capabilities
+        }
         for preset_id in set(EXPECTED_ARGUMENTS).difference(excluded):
             with self.subTest(preset_id=preset_id):
                 executable = self.make_fake_provider(preset_id)

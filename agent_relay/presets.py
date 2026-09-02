@@ -33,6 +33,12 @@ CHECKPOINT_STDIN_INSTRUCTION = (
     "Analyze the repository and return the next response without modifying files."
 )
 
+WORKSPACE_WRITE_CHECKPOINT_STDIN_INSTRUCTION = (
+    "Continue the task using the Agent Relay checkpoint provided on stdin. "
+    "Make only the requested repository changes inside the current workspace and "
+    "return the next response."
+)
+
 
 PRESETS = {
     "antigravity-cli": AgentPreset(
@@ -68,6 +74,32 @@ PRESETS = {
         prompt_transport="stdin",
         capabilities=("repo-read",),
         permission_profile="plan-read-only",
+        config_home_environment="CLAUDE_CONFIG_DIR",
+    ),
+    "claude-code-write": AgentPreset(
+        preset_id="claude-code-write",
+        default_agent_id="claude-code-write",
+        display_name="Anthropic Claude Code (workspace write)",
+        executable_name="claude",
+        fixed_arguments=(
+            "-p",
+            WORKSPACE_WRITE_CHECKPOINT_STDIN_INSTRUCTION,
+            "--safe-mode",
+            "--restricted",
+            "--permission-mode",
+            "acceptEdits",
+            "--tools",
+            "Read,Edit,Write,Glob,Grep",
+            "--disallowedTools",
+            "mcp__*",
+            "--disable-slash-commands",
+            "--no-session-persistence",
+            "--output-format",
+            "json",
+        ),
+        prompt_transport="stdin",
+        capabilities=("repo-read", "repo-write"),
+        permission_profile="workspace-write",
         config_home_environment="CLAUDE_CONFIG_DIR",
     ),
     "codex-cli": AgentPreset(

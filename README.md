@@ -27,7 +27,7 @@ The MVP answers one question: **can a user register arbitrary agents and move a 
 - Fail closed on authentication, timeout, overload, and unrecognized routed failures.
 - Extract bounded structured-result proposals from successful routed agents.
 - Preview proposed memory changes and accept them only with an unchanged checkpoint revision.
-- Opt a reviewed Codex CLI or Codex App Server write preset into one exact task and Git root.
+- Opt a reviewed Codex CLI, Codex App Server, or Claude Code write preset into one exact task and Git root.
 - Snapshot Git state before and after a write, then require explicit change acceptance or verified rollback.
 - Keep every write-capable agent out of automatic fallback routes.
 - Persist local state atomically with owner-only permissions where the filesystem supports them, without following managed-path symlinks or losing concurrent updates.
@@ -92,6 +92,15 @@ python3 -m agent_relay --state-dir .demo-relay handoff TASK_ID gemini-cli \
   --cwd .
 ```
 
+## Installation runbooks
+
+- [macOS native setup and operations](docs/runbook-macos.md)
+- [Windows setup and operations through WSL2](docs/runbook-windows.md)
+
+Native Windows Python is not currently supported because Relay's hardened state store
+depends on POSIX advisory locks and descriptor-relative filesystem operations. The
+Windows runbook uses WSL2 so those safety guarantees remain intact.
+
 ## Register a real or custom CLI
 
 Supply the executable separately from each fixed argument. This keeps untrusted checkpoint text out of a shell command:
@@ -110,7 +119,7 @@ python3 -m agent_relay agent add my-agent \
 
 The example flag is illustrative; use the non-interactive invocation supported by the locally installed agent. Environment values are never stored. Only base process variables and explicitly allowed names are passed to the child.
 
-Custom adapters still run with the user's operating-system permissions and can access the selected working directory. Relay coordinates agents; it is not itself an operating-system sandbox. The reviewed Codex presets additionally request Codex's own read-only or workspace-write sandbox. Captured stdout and stderr are bounded and returned to the invoking user, but are not added to the checkpoint ledger.
+Custom adapters still run with the user's operating-system permissions and can access the selected working directory. Relay coordinates agents; it is not itself an operating-system sandbox. Reviewed write presets also request the provider's bounded native permission mode. Captured stdout and stderr are bounded and returned to the invoking user, but are not added to the checkpoint ledger.
 
 The state store canonicalizes parent components but requires the selected state root itself, its managed `tasks` directory, and every managed JSON file to be real directories or regular files rather than symlinks. It keeps directory identities for the lifetime of the process and performs reads, temporary-file creation, replacement, and cleanup relative to verified directory descriptors. If a managed directory is replaced or the platform cannot provide the required safe path operations, Relay fails closed instead of following the new path.
 
@@ -124,7 +133,7 @@ Check which supported CLIs are installed without launching a model request:
 python3 -m agent_relay agent presets
 ```
 
-Read-only planning remains the default. Two separately named Codex presets expose the opt-in write policy:
+Read-only planning remains the default. Three separately named presets expose the opt-in write policy without changing their read counterparts:
 
 | Preset | Executable | Restricted mode |
 | --- | --- | --- |
@@ -133,6 +142,7 @@ Read-only planning remains the default. Two separately named Codex presets expos
 | `codex-cli-write` | `codex` | ephemeral `exec`, workspace-write sandbox, on-request escalation policy |
 | `codex-app-server-write` | `codex` | one App Server turn, one writable root, no network or temporary-directory writes |
 | `claude-code` | `claude` | non-interactive plan mode |
+| `claude-code-write` | `claude` | restricted mode with repository file tools only; requires Claude Code 2.1.248+ |
 | `gemini-cli` | `gemini` | headless plan approval mode |
 | `antigravity-cli` | `agy` | plan mode with JSON-lines stdin |
 | `github-copilot` | `copilot` | read tools only; parked for the later GitHub Education phase |
@@ -155,7 +165,7 @@ Every preset follows the same baseline:
 - Relay reuses the CLI's local authentication and never stores provider tokens.
 - Dangerous auto-approval and permission-bypass flags are not enabled.
 
-Existing read registrations are never upgraded to write access. Codex write behavior follows OpenAI's documented [sandbox and approval model](https://learn.chatgpt.com/codex/sandboxing) and [writable-root permissions](https://learn.chatgpt.com/codex/permissions). Other provider behavior is based on the official [Codex non-interactive guide](https://developers.openai.com/codex/noninteractive), [Claude Code CLI reference](https://code.claude.com/docs/en/cli-usage), [Gemini CLI headless guide](https://geminicli.com/docs/cli/headless/), and [Antigravity headless guide](https://antigravity.google/docs/cli/headless/).
+Existing read registrations are never upgraded to write access. Codex write behavior follows OpenAI's documented [sandbox and approval model](https://learn.chatgpt.com/codex/sandboxing) and [writable-root permissions](https://learn.chatgpt.com/codex/permissions). Claude write behavior follows Anthropic's documented [restricted mode](https://code.claude.com/docs/en/permission-modes) and [CLI permission controls](https://code.claude.com/docs/en/permissions). Other provider behavior is based on the official [Codex non-interactive guide](https://developers.openai.com/codex/noninteractive), [Claude Code CLI reference](https://code.claude.com/docs/en/cli-usage), [Gemini CLI headless guide](https://geminicli.com/docs/cli/headless/), and [Antigravity headless guide](https://antigravity.google/docs/cli/headless/).
 
 ### Codex App support
 
@@ -202,6 +212,8 @@ Workspace writes use two independent keys: the agent registration must come from
 python3 -m agent_relay agent add-preset codex-cli-write --id codex-writer
 # App Server is also supported:
 python3 -m agent_relay agent add-preset codex-app-server-write --id codex-app-writer
+# Claude Code 2.1.248+ is also supported:
+python3 -m agent_relay agent add-preset claude-code-write --id claude-writer
 ```
 
 Authorize only the agent and repository needed for the task:
@@ -211,7 +223,7 @@ python3 -m agent_relay workspace authorize TASK_ID codex-writer \
   --root /absolute/path/to/repository
 ```
 
-Authorization fails unless the path is the exact top level of an existing Git repository. It is recorded as a `workspace-write-authorize` action scoped to the task, agent ID, and canonical root. It does not authorize a different task, a second Codex registration, a subdirectory, or another repository.
+Authorization fails unless the path is the exact top level of an existing Git repository. It is recorded as a `workspace-write-authorize` action scoped to the task, agent ID, and canonical root. It does not authorize a different task, a second provider registration, a subdirectory, or another repository.
 
 Preview and execute the handoff normally, using that same root as the working directory:
 
@@ -256,7 +268,13 @@ Relay supplies rollback guidance but never deletes files, resets Git history, or
 python3 -m agent_relay workspace revoke TASK_ID codex-writer
 ```
 
-The Codex CLI write preset ignores user configuration and execution rules, requests `workspace-write` with `on-request` escalation, disables command network access, and excludes both temporary-directory roots. The App Server write preset sends the same one-root, no-network, no-temp boundary in every turn. Relay declines App Server requests that cross the approved boundary. Write presets are never accepted in `route set`, so quota fallback remains read-only and an uncertain write can never trigger another agent automatically.
+The Codex CLI write preset ignores user configuration and execution rules, requests `workspace-write` with `on-request` escalation, disables command network access, and excludes both temporary-directory roots. The App Server write preset sends the same one-root, no-network, no-temp boundary in every turn. Relay declines App Server requests that cross the approved boundary.
+
+The Claude write preset requires Claude Code 2.1.248 or newer and combines `--safe-mode`, `--restricted`, and `acceptEdits`. Its built-in tool set is limited to `Read`, `Edit`, `Write`, `Glob`, and `Grep`; Bash, web tools, slash commands, session persistence, MCP tools, and local customizations are excluded. Restricted mode ignores user and project settings and confines file tools to the working directory. An older CLI or any rejected flag produces a non-zero result that Relay treats as ambiguous and blocks for review.
+
+Gemini [`auto_edit`](https://geminicli.com/docs/reference/configuration/#approval-mode) and Antigravity [`accept-edits`](https://antigravity.google/docs/cli/modes/) were evaluated but do not yet have write presets. Their current [Gemini sandbox](https://geminicli.com/docs/cli/sandbox/) and [Antigravity permission](https://antigravity.google/docs/cli/permissions/) controls can still be widened by local or project settings and do not give Relay a verified, settings-independent exact-root boundary on every supported platform. They remain unchanged as read/plan presets. Relay also rejects custom registrations that claim the unapproved `gemini-cli-write` or `antigravity-cli-write` provider IDs.
+
+All write presets are rejected by `route set`, so quota fallback remains read-only and an uncertain write can never trigger another agent automatically.
 
 ### Multiple Codex or Claude instances
 
@@ -410,7 +428,7 @@ The GitHub Actions workflow runs the same suite on Python 3.9 through 3.14 with 
 
 - Manual handoffs, including Codex App Server turns, remain user-confirmed; ordered CLI routes can automatically continue only after conservative limit classification.
 - The adapter launches CLI processes but does not scrape or impersonate consumer subscriptions.
-- Read-only or plan-only presets remain the default; write access currently supports only the separately named Codex CLI and Codex App Server write presets.
+- Read-only or plan-only presets remain the default; write access supports only the separately named Codex CLI, Codex App Server, and restricted Claude Code write presets. Gemini and Antigravity remain read/plan-only.
 - Codex App integration is limited to documented local App Server stdio calls; live desktop UI control, task discovery, WebSocket transport, and automatic app routing are not implemented.
 - Workspace review records content-free Git state metadata, not raw patch contents; the user must inspect the real Git diff before acceptance.
 - Structured result fields and reported tests remain agent claims; Relay does not independently execute tests.
@@ -424,6 +442,6 @@ Work is tracked in [GitHub Issues](https://github.com/Oussamoux1234/agent-relay/
 
 Agent Relay is licensed under the [Apache License 2.0](LICENSE).
 
-## Next milestone
+## Roadmap
 
-[Extend approved workspace-write profiles beyond Codex](https://github.com/Oussamoux1234/agent-relay/issues/9), one provider at a time and only after verifying a bounded official mode. [GitHub Education/Copilot support](https://github.com/Oussamoux1234/agent-relay/issues/7) remains a separate later milestone.
+[GitHub Education/Copilot support](https://github.com/Oussamoux1234/agent-relay/issues/7) remains deliberately parked for a later milestone. New provider write presets will be added only when current official controls can preserve the same exact task/agent/root and review boundary.

@@ -119,7 +119,7 @@ AUTO_ROUTE_PROVIDER_IDS = frozenset(
     ("antigravity-cli", "claude-code", "codex-cli", "gemini-cli")
 )
 WORKSPACE_WRITE_PROVIDER_IDS = frozenset(
-    ("codex-cli-write", "codex-app-server-write")
+    ("claude-code-write", "codex-cli-write", "codex-app-server-write")
 )
 WORKSPACE_WRITE_ACTION_KINDS = frozenset(
     ("workspace-write", "session-workspace-write")
