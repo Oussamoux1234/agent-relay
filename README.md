@@ -367,7 +367,15 @@ Execute the route after checking the preview:
 python3 -m agent_relay route run TASK_ID --execute --cwd .
 ```
 
-Relay invokes the active CLI agent first. If that process exits with a recognized quota or rate-limit signal, Relay records a redacted failure class and immediately invokes the next candidate with the shared checkpoint. A process that cannot be launched is also skipped safely because it could not have performed work. A successful candidate becomes the task's active agent; later runs start there and continue only through the remaining route entries.
+Relay invokes the active CLI agent first. If that process exits normally with a
+recognized provider-owned quota or rate-limit signal, Relay records a redacted
+failure class and immediately invokes the next candidate with the shared checkpoint.
+Structured terminal errors are preferred. Free-text matching is provider-specific
+and reads only stderr; model output on stdout can never authorize fallback. Signal
+exits, missing return codes, timeouts, and inconsistent terminal states always block.
+A process that cannot be launched is skipped safely because it could not have
+performed work. A successful candidate becomes the task's active agent; later runs
+start there and continue only through the remaining route entries.
 
 Automatic routes currently accept only `codex-cli`, `claude-code`, and
 `github-copilot` provider registrations. Gemini and Antigravity can still be
@@ -411,7 +419,16 @@ python3 -m agent_relay route recover TASK_ID codex-primary
 
 Recovery changes only the active route pointer, writes an auditable `route-recover` action, and launches no provider process. The next `route run` remains preview-first unless `--execute` is supplied.
 
-The detector recognizes documented signals such as OpenAI 429/quota codes, Claude `rate_limit_error`, Gemini `429 RESOURCE_EXHAUSTED`, and Copilot rate-limit or AI-credit exhaustion messages. The cooldown fields follow the official [OpenAI error-code guide](https://developers.openai.com/api/docs/guides/error-codes), [Claude rate-limit reference](https://platform.claude.com/docs/en/api/rate-limits), [Google `RetryInfo` contract](https://docs.cloud.google.com/php/docs/reference/common-protos/latest/Rpc.RetryInfo), [GitHub Copilot troubleshooting guide](https://docs.github.com/en/copilot/how-tos/troubleshoot-copilot/troubleshoot-common-issues), and [GitHub usage-limit guide](https://docs.github.com/en/copilot/concepts/usage-limits). General classification also follows the [Claude API error reference](https://platform.claude.com/docs/en/api/errors) and [Gemini troubleshooting guide](https://ai.google.dev/gemini-api/docs/troubleshooting).
+The detector recognizes documented signals such as OpenAI 429/quota codes, Claude
+structured API errors plus session, weekly, model, and credit exhaustion notices,
+Gemini `429 RESOURCE_EXHAUSTED`, and Copilot rate-limit or AI-credit exhaustion
+messages. The cooldown fields follow the official [OpenAI error-code guide](https://developers.openai.com/api/docs/guides/error-codes),
+[Claude rate-limit reference](https://platform.claude.com/docs/en/api/rate-limits),
+[Google `RetryInfo` contract](https://docs.cloud.google.com/php/docs/reference/common-protos/latest/Rpc.RetryInfo),
+[GitHub Copilot troubleshooting guide](https://docs.github.com/en/copilot/how-tos/troubleshoot-copilot/troubleshoot-common-issues),
+and [GitHub usage-limit guide](https://docs.github.com/en/copilot/concepts/usage-limits).
+General classification also follows the [Claude API error reference](https://platform.claude.com/docs/en/api/errors)
+and [Gemini troubleshooting guide](https://ai.google.dev/gemini-api/docs/troubleshooting).
 
 Failure attempts persist only classifications and execution metadata. Successful attempts may persist a bounded, validated result proposal for review. Raw stdout and stderr are returned to the invoking user but are not written into the task ledger. Automatic routing currently applies to Relay-launched CLI processes. It cannot observe a limit encountered inside an unrelated Codex App, Claude Code, or Antigravity session.
 
@@ -497,6 +514,7 @@ GitHub Education/Copilot read routing is delivered in v0.9.0. Version 0.9.1
 removes Gemini and Antigravity from automatic routes until hard containment is
 available. Version 0.9.2 moves default state outside repositories and rejects
 state/workspace overlap for write-authorized tasks. Version 0.9.3 terminates provider
-process groups and preserves unknown/review state across interruptions. New provider
-write presets will be added only when current official controls can preserve the same
-exact task/agent/root and review boundary.
+process groups and preserves unknown/review state across interruptions. Version 0.9.4
+trusts only structured terminal errors or provider-specific stderr patterns for
+automatic fallback. New provider write presets will be added only when current
+official controls can preserve the same exact task/agent/root and review boundary.

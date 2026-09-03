@@ -76,6 +76,27 @@ class RoutingTestCase(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertNotIn("rate_limit_error", persisted_text)
 
+    def test_model_stdout_cannot_trigger_a_backup_agent(self) -> None:
+        marker = self.root / "backup-ran-from-model-text"
+        self.register(
+            "codex-primary",
+            "print('HTTP 429: RateLimitError'); raise SystemExit(1)",
+        )
+        self.register(
+            "claude-backup",
+            "from pathlib import Path; Path(%r).write_text('ran')" % str(marker),
+            provider_id="claude-code",
+        )
+        task = self.create_routed_task("codex-primary", "claude-backup")
+
+        outcome = self.service.run_route(task.task_id, self.root)
+
+        self.assertEqual(len(outcome.attempts), 1)
+        self.assertEqual(outcome.attempts[0].classification.category, "unknown")
+        self.assertFalse(outcome.attempts[0].classification.safe_to_fallback)
+        self.assertEqual(outcome.task.status, "blocked")
+        self.assertFalse(marker.exists())
+
     def test_copilot_rate_limit_switches_to_the_next_read_agent(self) -> None:
         self.register(
             "copilot-primary",
