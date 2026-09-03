@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import json
-import os
-import select
+import queue
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -18,6 +18,7 @@ from .adapters import (
 )
 from .errors import ValidationError
 from .models import AgentSpec
+from .process_control import spawn_process
 from .version import VERSION
 
 
@@ -28,6 +29,45 @@ MAX_SESSION_ID_CHARACTERS = 512
 
 class AppServerProtocolError(Exception):
     """A bounded, user-safe error raised for invalid app-server behavior."""
+
+
+class _PipeReader:
+    """Read a subprocess pipe with deadlines on both POSIX and Windows."""
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+        self._queue: queue.Queue = queue.Queue()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            read = getattr(self._stream, "read1", self._stream.read)
+            while True:
+                chunk = read(64 * 1024)
+                if not chunk:
+                    self._queue.put(("eof", None))
+                    return
+                self._queue.put(("data", chunk))
+        except (OSError, ValueError) as exc:
+            self._queue.put(("error", exc))
+
+    def read(self, deadline: float) -> bytes:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError
+        try:
+            kind, value = self._queue.get(timeout=remaining)
+        except queue.Empty as exc:
+            raise TimeoutError from exc
+        if kind == "data":
+            return value
+        if kind == "error":
+            raise AppServerProtocolError("could not read app-server output") from value
+        return b""
+
+    def join(self) -> None:
+        self._thread.join(timeout=1)
 
 
 class CodexAppServerAdapter:
@@ -150,12 +190,10 @@ class CodexAppServerAdapter:
 
     def _read_message(
         self,
-        process: subprocess.Popen,
+        reader: _PipeReader,
         deadline: float,
         buffer: bytearray,
     ) -> Dict[str, Any]:
-        if process.stdout is None:
-            raise AppServerProtocolError("app-server stdout is unavailable")
         while True:
             newline = buffer.find(b"\n")
             if newline >= 0:
@@ -171,19 +209,7 @@ class CodexAppServerAdapter:
                     raise AppServerProtocolError("app-server message must be an object")
                 return decoded
 
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError
-            try:
-                ready, _, _ = select.select([process.stdout.fileno()], [], [], remaining)
-            except (OSError, ValueError) as exc:
-                raise AppServerProtocolError("could not read app-server output") from exc
-            if not ready:
-                raise TimeoutError
-            try:
-                chunk = os.read(process.stdout.fileno(), 64 * 1024)
-            except OSError as exc:
-                raise AppServerProtocolError("could not read app-server output") from exc
+            chunk = reader.read(deadline)
             if not chunk:
                 if buffer:
                     raise AppServerProtocolError("app-server ended with an incomplete JSONL message")
@@ -195,6 +221,7 @@ class CodexAppServerAdapter:
     def _receive_until(
         self,
         process: subprocess.Popen,
+        reader: _PipeReader,
         deadline: float,
         buffer: bytearray,
         event_types: List[str],
@@ -203,7 +230,7 @@ class CodexAppServerAdapter:
         message_output: Optional[bytearray] = None,
     ) -> Dict[str, Any]:
         for _ in range(MAX_PROTOCOL_EVENTS):
-            message = self._read_message(process, deadline, buffer)
+            message = self._read_message(reader, deadline, buffer)
             method = message.get("method")
             if isinstance(method, str):
                 self._record_event(event_types, method)
@@ -279,14 +306,13 @@ class CodexAppServerAdapter:
 
         with tempfile.TemporaryFile(mode="w+b") as stderr_file:
             try:
-                process = subprocess.Popen(
+                process = spawn_process(
                     list(spec.command),
-                    cwd=str(working_directory),
-                    env=CliAgentAdapter._environment(spec),
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=stderr_file,
-                    start_new_session=True,
+                    working_directory,
+                    CliAgentAdapter._environment(spec),
+                    subprocess.PIPE,
+                    subprocess.PIPE,
+                    stderr_file,
                 )
             except (FileNotFoundError, PermissionError, OSError) as exc:
                 return AgentExecutionResult(
@@ -299,6 +325,10 @@ class CodexAppServerAdapter:
                     error="could not launch configured executable: %s" % type(exc).__name__,
                 )
 
+            if process.stdout is None:
+                CliAgentAdapter._terminate_process_group(process)
+                raise AppServerProtocolError("app-server stdout is unavailable")
+            reader = _PipeReader(process.stdout)
             deadline = start + spec.timeout_seconds
             buffer = bytearray()
             message_output = bytearray()
@@ -319,7 +349,14 @@ class CodexAppServerAdapter:
                         },
                     },
                 )
-                self._receive_until(process, deadline, buffer, event_types, response_id=1)
+                self._receive_until(
+                    process,
+                    reader,
+                    deadline,
+                    buffer,
+                    event_types,
+                    response_id=1,
+                )
                 self._send(process, {"method": "initialized"})
 
                 request_id = 2
@@ -344,6 +381,7 @@ class CodexAppServerAdapter:
                 self._send(process, {"id": request_id, "method": method, "params": params})
                 response = self._receive_until(
                     process,
+                    reader,
                     deadline,
                     buffer,
                     event_types,
@@ -372,6 +410,7 @@ class CodexAppServerAdapter:
                 )
                 response = self._receive_until(
                     process,
+                    reader,
                     deadline,
                     buffer,
                     event_types,
@@ -383,6 +422,7 @@ class CodexAppServerAdapter:
                 turn_id = self._identifier(turn, "turn")
                 completed = self._receive_until(
                     process,
+                    reader,
                     deadline,
                     buffer,
                     event_types,
@@ -418,6 +458,7 @@ class CodexAppServerAdapter:
                         pass
                 if process.stdout is not None:
                     process.stdout.close()
+                reader.join()
 
             elapsed_ms = int((time.monotonic() - start) * 1000)
             stderr = CliAgentAdapter._read_tail(stderr_file)

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import stat
@@ -14,6 +13,12 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 from .errors import ConflictError, NotFoundError, ValidationError
 from .health import AgentHealthRecord, HEALTH_SCHEMA_VERSION, MAX_HEALTH_RECORDS
 from .models import AgentSpec, SCHEMA_VERSION, TaskCheckpoint, utc_now
+from .windows_state import WindowsStateBackend
+
+if os.name != "nt":
+    import fcntl
+else:
+    fcntl = None
 
 
 class RelayStore:
@@ -30,6 +35,10 @@ class RelayStore:
         self.registry_path = self.root / "agents.json"
         self.health_path = self.root / "health.json"
         self.tasks_dir = self.root / "tasks"
+        self._windows_backend = None
+        if os.name == "nt":
+            self._windows_backend = WindowsStateBackend(self.root, self._LOCK_FILENAME)
+            return
         self._root_identity = self._ensure_private_directory(self.root)
         self._tasks_identity = self._ensure_private_child_directory("tasks")
         self._lock_identity = self._ensure_transaction_lock()
@@ -229,6 +238,8 @@ class RelayStore:
         return metadata
 
     def _state_file_exists(self, path: Path) -> bool:
+        if self._windows_backend is not None:
+            return self._windows_backend.state_file_exists(path)
         parent_descriptor = self._open_parent(path)
         try:
             return self._file_metadata(parent_descriptor, path.name) is not None
@@ -238,6 +249,11 @@ class RelayStore:
     @contextmanager
     def _exclusive_transaction(self) -> Iterator[None]:
         """Serialize one complete read-modify-write state transaction."""
+
+        if self._windows_backend is not None:
+            with self._windows_backend.exclusive_transaction():
+                yield
+            return
 
         parent_descriptor = self._open_root_directory()
         descriptor = None
@@ -264,6 +280,7 @@ class RelayStore:
                 raise ValidationError("state lock changed during validation")
             while True:
                 try:
+                    assert fcntl is not None
                     fcntl.flock(descriptor, fcntl.LOCK_EX)
                     break
                 except InterruptedError:
@@ -283,6 +300,7 @@ class RelayStore:
         finally:
             if locked and descriptor is not None:
                 try:
+                    assert fcntl is not None
                     fcntl.flock(descriptor, fcntl.LOCK_UN)
                 except OSError:
                     pass
@@ -291,6 +309,10 @@ class RelayStore:
             os.close(parent_descriptor)
 
     def _read_json(self, path: Path) -> Dict[str, Any]:
+        if self._windows_backend is not None:
+            if not self._windows_backend.state_file_exists(path):
+                raise NotFoundError("state file was not found: %s" % path.name)
+            return self._windows_backend.read_json(path)
         parent_descriptor = self._open_parent(path)
         descriptor = None
         try:
@@ -325,6 +347,9 @@ class RelayStore:
         return value
 
     def _atomic_write(self, path: Path, value: Dict[str, Any]) -> None:
+        if self._windows_backend is not None:
+            self._windows_backend.atomic_write(path, value)
+            return
         parent_descriptor = self._open_parent(path)
         temporary_name = ".%s.%s.tmp" % (path.name, uuid.uuid4().hex)
         descriptor = None
@@ -481,13 +506,16 @@ class RelayStore:
 
     def list_tasks(self) -> List[TaskCheckpoint]:
         checkpoints = []
-        directory_descriptor = self._open_tasks_directory()
-        try:
-            names = sorted(os.listdir(directory_descriptor))
-        except OSError as exc:
-            raise ValidationError("could not list state tasks") from exc
-        finally:
-            os.close(directory_descriptor)
+        if self._windows_backend is not None:
+            names = self._windows_backend.list_task_names()
+        else:
+            directory_descriptor = self._open_tasks_directory()
+            try:
+                names = sorted(os.listdir(directory_descriptor))
+            except OSError as exc:
+                raise ValidationError("could not list state tasks") from exc
+            finally:
+                os.close(directory_descriptor)
         for name in names:
             if name.endswith(".json"):
                 path = self.tasks_dir / name

@@ -456,6 +456,7 @@ class WorkspaceServiceTestCase(unittest.TestCase):
         with self.assertRaises(ValidationError):
             self.service.configure_route(task.task_id, ["route-reader", "writer"])
 
+    @unittest.skipIf(sys.platform == "win32", "fixture is a POSIX executable script")
     def test_claude_write_preset_reuses_authorization_and_review_gates(self) -> None:
         executable = self.root / "claude-writer"
         executable.write_text(

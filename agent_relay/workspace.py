@@ -293,7 +293,19 @@ class WorkspaceInspector:
     def _environment() -> Dict[str, str]:
         environment = {
             name: os.environ[name]
-            for name in ("HOME", "LANG", "LC_ALL", "PATH", "TMPDIR")
+            for name in (
+                "HOME",
+                "LANG",
+                "LC_ALL",
+                "PATH",
+                "PATHEXT",
+                "SYSTEMROOT",
+                "TEMP",
+                "TMP",
+                "TMPDIR",
+                "USERPROFILE",
+                "WINDIR",
+            )
             if name in os.environ
         }
         environment.update(

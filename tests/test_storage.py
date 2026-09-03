@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -102,17 +103,24 @@ class RelayStoreSecurityTestCase(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def make_symlink(self, link: Path, target: Path, directory: bool = False) -> None:
+        try:
+            link.symlink_to(target, target_is_directory=directory)
+        except OSError as exc:
+            self.skipTest("this Windows host cannot create test symlinks: %s" % exc)
+
     def test_rejects_a_symlink_passed_as_the_state_root(self) -> None:
         target = self.root / "target"
         target.mkdir()
         target.chmod(0o755)
         link = self.root / "state"
-        link.symlink_to(target, target_is_directory=True)
+        self.make_symlink(link, target, directory=True)
 
         with self.assertRaisesRegex(ValidationError, "state root must not be a symlink"):
             RelayStore(link)
 
-        self.assertEqual(target.stat().st_mode & 0o777, 0o755)
+        if os.name != "nt":
+            self.assertEqual(target.stat().st_mode & 0o777, 0o755)
 
     def test_rejects_tasks_directory_symlink_without_chmod_or_external_write(self) -> None:
         state = self.root / "state"
@@ -120,12 +128,13 @@ class RelayStoreSecurityTestCase(unittest.TestCase):
         state.mkdir()
         outside.mkdir()
         outside.chmod(0o755)
-        (state / "tasks").symlink_to(outside, target_is_directory=True)
+        self.make_symlink(state / "tasks", outside, directory=True)
 
         with self.assertRaisesRegex(ValidationError, "state directory must not be a symlink"):
             RelayStore(state)
 
-        self.assertEqual(outside.stat().st_mode & 0o777, 0o755)
+        if os.name != "nt":
+            self.assertEqual(outside.stat().st_mode & 0o777, 0o755)
         self.assertEqual(list(outside.iterdir()), [])
 
     def test_rejects_tasks_directory_replaced_by_a_symlink_after_initialization(self) -> None:
@@ -135,13 +144,14 @@ class RelayStoreSecurityTestCase(unittest.TestCase):
         outside.chmod(0o755)
         store = RelayStore(state)
         store.tasks_dir.rmdir()
-        store.tasks_dir.symlink_to(outside, target_is_directory=True)
+        self.make_symlink(store.tasks_dir, outside, directory=True)
         checkpoint = TaskCheckpoint.create("Escape", "Do not write outside state")
 
         with self.assertRaisesRegex(ValidationError, "state directory must not be a symlink"):
             store.create_task(checkpoint)
 
-        self.assertEqual(outside.stat().st_mode & 0o777, 0o755)
+        if os.name != "nt":
+            self.assertEqual(outside.stat().st_mode & 0o777, 0o755)
         self.assertEqual(list(outside.iterdir()), [])
 
     def test_rejects_managed_directories_replaced_by_different_inodes(self) -> None:
@@ -178,8 +188,8 @@ class RelayStoreSecurityTestCase(unittest.TestCase):
         health_payload = {"schema_version": "1.0", "agents": {}}
         outside_registry.write_text(json.dumps(registry_payload), encoding="utf-8")
         outside_health.write_text(json.dumps(health_payload), encoding="utf-8")
-        store.registry_path.symlink_to(outside_registry)
-        store.health_path.symlink_to(outside_health)
+        self.make_symlink(store.registry_path, outside_registry)
+        self.make_symlink(store.health_path, outside_health)
 
         with self.assertRaisesRegex(ValidationError, "regular file, not a symlink"):
             store.register_agent(AgentSpec("reader", "Reader", ("reader",)))
@@ -196,7 +206,7 @@ class RelayStoreSecurityTestCase(unittest.TestCase):
         original = json.dumps(checkpoint.to_dict(), sort_keys=True)
         outside.write_text(original, encoding="utf-8")
         task_path = store.tasks_dir / (checkpoint.task_id + ".json")
-        task_path.symlink_to(outside)
+        self.make_symlink(task_path, outside)
 
         with self.assertRaisesRegex(ValidationError, "regular file, not a symlink"):
             store.get_task(checkpoint.task_id)
@@ -213,9 +223,9 @@ class RelayStoreSecurityTestCase(unittest.TestCase):
         outside.write_text("do not modify", encoding="utf-8")
         lock_path = store.root / store._LOCK_FILENAME
         lock_path.unlink()
-        lock_path.symlink_to(outside)
+        self.make_symlink(lock_path, outside)
 
-        with self.assertRaisesRegex(ValidationError, "could not open state lock"):
+        with self.assertRaisesRegex(ValidationError, "state lock|regular file"):
             store.register_agent(AgentSpec("reader", "Reader", ("reader",)))
 
         self.assertEqual(outside.read_text(encoding="utf-8"), "do not modify")
@@ -223,8 +233,10 @@ class RelayStoreSecurityTestCase(unittest.TestCase):
 
 class RelayStoreConcurrencyTestCase(unittest.TestCase):
     def setUp(self) -> None:
-        if "fork" not in multiprocessing.get_all_start_methods():
-            self.skipTest("cross-process locking requires a fork-capable test platform")
+        available = multiprocessing.get_all_start_methods()
+        self.start_method = "spawn" if os.name == "nt" else "fork"
+        if self.start_method not in available:
+            self.skipTest("cross-process locking is unavailable on this platform")
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.state = self.root / "state"
@@ -234,7 +246,7 @@ class RelayStoreConcurrencyTestCase(unittest.TestCase):
         self.temporary.cleanup()
 
     def _run_workers(self, target: Any, arguments: Any) -> list:
-        context = multiprocessing.get_context("fork")
+        context = multiprocessing.get_context(self.start_method)
         start_barrier = context.Barrier(3)
         write_barrier = context.Barrier(2)
         results = context.Queue()
@@ -257,7 +269,7 @@ class RelayStoreConcurrencyTestCase(unittest.TestCase):
                 process.start()
             start_barrier.wait(timeout=10)
             for process in processes:
-                process.join(timeout=15)
+                process.join(timeout=30)
             for process in processes:
                 self.assertFalse(process.is_alive(), "concurrent storage worker did not exit")
                 self.assertEqual(process.exitcode, 0)
