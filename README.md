@@ -148,7 +148,7 @@ Read-only planning remains the default. Three separately named presets expose th
 | `codex-app-server` | `codex` | one App Server turn; restricted workspace reads and no approvals |
 | `codex-cli-write` | `codex` | ephemeral `exec`; permission profile writes only the active workspace, with on-request escalation |
 | `codex-app-server-write` | `codex` | one App Server turn; one writable/readable workspace root, no command network or temporary-directory writes |
-| `claude-code` | `claude` | non-interactive plan mode |
+| `claude-code` | `claude` | restricted, safe, non-persistent plan mode with repository read tools only; requires Claude Code 2.1.248+ |
 | `claude-code-write` | `claude` | restricted mode with repository file tools only; requires Claude Code 2.1.248+ |
 | `gemini-cli` | `gemini` | explicit handoff only; headless Plan Mode is not a read-only boundary |
 | `antigravity-cli` | `agy` | explicit handoff only; Plan Mode is not a read-only boundary |
@@ -175,7 +175,9 @@ Every preset follows the same baseline:
 - Relay reuses the CLI's local authentication and never stores provider tokens.
 - Dangerous auto-approval and permission-bypass flags are not enabled.
 
-Existing read registrations are never upgraded to write access. Codex CLI presets use OpenAI's documented [permission profiles](https://learn.chatgpt.com/docs/permissions): filesystem access is denied by default, `:minimal` runtime paths are readable, the active workspace root is read-only or writable according to the preset, and command network access is disabled. Codex App Server turns use its documented [restricted read-access policy](https://learn.chatgpt.com/docs/app-server) with the canonical workspace as the only added readable root. Claude write behavior follows Anthropic's documented [restricted mode](https://code.claude.com/docs/en/permission-modes) and [CLI permission controls](https://code.claude.com/docs/en/permissions). Other provider behavior is based on the official [Codex non-interactive guide](https://developers.openai.com/codex/noninteractive), [Claude Code CLI reference](https://code.claude.com/docs/en/cli-usage), [Gemini CLI headless guide](https://geminicli.com/docs/cli/headless/), [Antigravity headless guide](https://antigravity.google/docs/cli/headless/), and [GitHub Copilot CLI command reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference).
+Existing read registrations are never upgraded to write access. Codex CLI presets use OpenAI's documented [permission profiles](https://learn.chatgpt.com/docs/permissions): filesystem access is denied by default, `:minimal` runtime paths are readable, the active workspace root is read-only or writable according to the preset, and command network access is disabled. Codex App Server turns use its documented [restricted read-access policy](https://learn.chatgpt.com/docs/app-server) with the canonical workspace as the only added readable root. Both Claude presets require Claude Code 2.1.248 or newer and use Anthropic's documented [`--restricted` and `--safe-mode` controls](https://code.claude.com/docs/en/cli-usage). Other provider behavior is based on the official [Codex non-interactive guide](https://developers.openai.com/codex/noninteractive), [Gemini CLI headless guide](https://geminicli.com/docs/cli/headless/), [Antigravity headless guide](https://antigravity.google/docs/cli/headless/), and [GitHub Copilot CLI command reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference).
+
+The Claude read preset permits only `Read`, `Glob`, and `Grep`, denies every MCP tool, disables Chrome integration, slash commands, and session persistence, and starts in Plan Mode. Restricted mode confines built-in file tools to the working directory; safe mode prevents user and project CLAUDE.md files, skills, plugins, hooks, MCP servers, commands, agents, workflows, and auto memory from loading. Managed policy settings still apply, and Anthropic explicitly notes that policy-configured hooks may still execute. Treat those organization-controlled hooks as trusted administrator code or run Relay and Claude inside an outer OS sandbox; Relay cannot disable them from the command line.
 
 Command network isolation is not a global offline switch. OpenAI documents that web search, apps/connectors, MCP servers, browser/computer use, Codex service traffic, and Codex Cloud have [separate external-surface controls](https://learn.chatgpt.com/docs/agent-approvals-security). Every reviewed Codex preset therefore also disables web search, configured MCP servers, apps/plugins, hooks, browser/computer use, image generation, remote plugins, MCP dependency installation, and tool suggestions through explicit command-line overrides. Model and authentication traffic still reaches the Codex service because the provider cannot run without it; Relay does not enable or launch Codex Cloud tasks.
 
@@ -494,6 +496,7 @@ PYTHONPYCACHEPREFIX=/tmp/agent-relay-pycache python3 -m unittest discover -v
 
 The GitHub Actions workflow runs the same suite on Python 3.9 through 3.14 with read-only repository permissions.
 When Codex CLI is installed, the native containment test invokes `codex sandbox` directly, proves that a file inside the temporary workspace is readable, and proves that a sibling file is not. It skips only when Codex is absent or the current host forbids a nested native sandbox.
+The authenticated Claude native fixture is opt-in because it makes one real model request. Set `AGENT_RELAY_RUN_CLAUDE_NATIVE_TESTS=1` before running `python3 -m unittest tests.test_claude_native -v`; it plants a sibling secret plus malicious project instructions, a session hook, and an MCP server, then verifies that restricted safe mode reads only the in-workspace probe and activates none of those customizations.
 
 ## Deliberate MVP boundaries
 
@@ -523,5 +526,8 @@ process groups and preserves unknown/review state across interruptions. Version 
 trusts only structured terminal errors or provider-specific stderr patterns for
 automatic fallback. Version 0.9.5 restricts Codex CLI and App Server reads to the
 active workspace plus platform-minimal paths and disables external tool surfaces
-independently from command-network isolation. New provider write presets will be added only when current
-official controls can preserve the same exact task/agent/root and review boundary.
+independently from command-network isolation. Version 0.9.6 confines Claude read
+handoffs with restricted and safe modes, a read-only tool allowlist, and no local
+customizations or persistence. New provider write presets will be added only when
+current official controls can preserve the same exact task/agent/root and review
+boundary.

@@ -79,8 +79,17 @@ EXPECTED_ARGUMENTS = {
         "-p",
         "Continue the task using the Agent Relay checkpoint provided on stdin. "
         "Analyze the repository and return the next response without modifying files.",
+        "--safe-mode",
+        "--restricted",
         "--permission-mode",
         "plan",
+        "--tools",
+        "Read,Glob,Grep",
+        "--disallowedTools",
+        "mcp__*",
+        "--no-chrome",
+        "--disable-slash-commands",
+        "--no-session-persistence",
         "--output-format",
         "json",
     ),
@@ -206,6 +215,12 @@ class ProviderPresetTestCase(unittest.TestCase):
         for status in statuses.values():
             self.assertFalse(status["available"])
             self.assertIsNone(status["executable"])
+        self.assertEqual(statuses["claude-code"]["minimum_version"], "2.1.248")
+        self.assertEqual(
+            statuses["claude-code-write"]["minimum_version"],
+            "2.1.248",
+        )
+        self.assertIsNone(statuses["codex-cli"]["minimum_version"])
 
     def test_presets_have_reviewed_permission_bounded_invocations(self) -> None:
         for preset_id, expected_arguments in EXPECTED_ARGUMENTS.items():
@@ -320,6 +335,29 @@ class ProviderPresetTestCase(unittest.TestCase):
             spec.config_home,
             ("CLAUDE_CONFIG_DIR", str(config_home.resolve())),
         )
+
+    def test_claude_read_preset_is_restricted_to_repository_read_tools(self) -> None:
+        preset = PRESETS["claude-code"]
+        arguments = preset.fixed_arguments
+
+        self.assertIn("--safe-mode", arguments)
+        self.assertIn("--restricted", arguments)
+        self.assertEqual(
+            arguments[arguments.index("--permission-mode") + 1],
+            "plan",
+        )
+        self.assertEqual(
+            arguments[arguments.index("--tools") + 1],
+            "Read,Glob,Grep",
+        )
+        self.assertEqual(
+            arguments[arguments.index("--disallowedTools") + 1],
+            "mcp__*",
+        )
+        self.assertIn("--no-chrome", arguments)
+        self.assertIn("--disable-slash-commands", arguments)
+        self.assertIn("--no-session-persistence", arguments)
+        self.assertEqual(preset.minimum_version, "2.1.248")
 
     def test_automatic_route_presets_remain_read_only(self) -> None:
         for preset_id in (

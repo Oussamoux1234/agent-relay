@@ -26,6 +26,7 @@ class AgentPreset:
     permission_profile: str
     adapter_type: str = "cli"
     config_home_environment: Optional[str] = None
+    minimum_version: Optional[str] = None
 
 
 CHECKPOINT_STDIN_INSTRUCTION = (
@@ -120,8 +121,17 @@ PRESETS = {
         fixed_arguments=(
             "-p",
             CHECKPOINT_STDIN_INSTRUCTION,
+            "--safe-mode",
+            "--restricted",
             "--permission-mode",
             "plan",
+            "--tools",
+            "Read,Glob,Grep",
+            "--disallowedTools",
+            "mcp__*",
+            "--no-chrome",
+            "--disable-slash-commands",
+            "--no-session-persistence",
             "--output-format",
             "json",
         ),
@@ -129,6 +139,7 @@ PRESETS = {
         capabilities=("repo-read",),
         permission_profile="plan-read-only",
         config_home_environment="CLAUDE_CONFIG_DIR",
+        minimum_version="2.1.248",
     ),
     "claude-code-write": AgentPreset(
         preset_id="claude-code-write",
@@ -155,6 +166,7 @@ PRESETS = {
         capabilities=("repo-read", "repo-write"),
         permission_profile="workspace-write",
         config_home_environment="CLAUDE_CONFIG_DIR",
+        minimum_version="2.1.248",
     ),
     "codex-cli": AgentPreset(
         preset_id="codex-cli",
@@ -295,6 +307,7 @@ def list_preset_statuses() -> Tuple[Dict[str, Any], ...]:
                 "adapter_type": preset.adapter_type,
                 "capabilities": list(preset.capabilities),
                 "permission_profile": preset.permission_profile,
+                "minimum_version": preset.minimum_version,
             }
         )
     return tuple(statuses)
