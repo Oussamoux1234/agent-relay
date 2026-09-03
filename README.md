@@ -295,6 +295,8 @@ python3 -m agent_relay workspace accept TASK_ID WRITE_ACTION_ID \
 
 If the run timed out, exited non-zero, lost protocol state, or could not be inspected afterward, its effects are ambiguous and the action always stays blocked. `resolve` cannot override a write-capable action. Restore only this action's changes without discarding pre-existing work, then let Relay verify that the complete pre-run snapshot is back:
 
+An interrupted Relay command terminates and reaps the provider process group before the interruption escapes. If the provider may have started, Relay first records the action as `unknown`; workspace-write actions also receive a post-run snapshot or an explicit unavailable review. Automatic routes never continue to a backup after an interruption.
+
 ```bash
 python3 -m agent_relay workspace verify-rollback TASK_ID WRITE_ACTION_ID \
   --expected-revision CHECKPOINT_REVISION \
@@ -494,6 +496,7 @@ Agent Relay is licensed under the [Apache License 2.0](LICENSE).
 GitHub Education/Copilot read routing is delivered in v0.9.0. Version 0.9.1
 removes Gemini and Antigravity from automatic routes until hard containment is
 available. Version 0.9.2 moves default state outside repositories and rejects
-state/workspace overlap for write-authorized tasks. New provider write presets will
-be added only when current official controls can preserve the same exact
-task/agent/root and review boundary.
+state/workspace overlap for write-authorized tasks. Version 0.9.3 terminates provider
+process groups and preserves unknown/review state across interruptions. New provider
+write presets will be added only when current official controls can preserve the same
+exact task/agent/root and review boundary.

@@ -7,6 +7,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from agent_relay.adapters import CliAgentAdapter
 from agent_relay.errors import ConflictError, ValidationError
 from agent_relay.models import AgentSpec
 from agent_relay.service import RelayService
@@ -120,6 +121,40 @@ class RoutingTestCase(unittest.TestCase):
         self.assertEqual(outcome.attempts[0].classification.category, "unknown")
         self.assertEqual(outcome.task.status, "blocked")
         self.assertEqual(outcome.task.actions[-1].status, "unknown")
+        self.assertFalse(marker.exists())
+
+    def test_keyboard_interrupt_persists_unknown_and_never_runs_backup(self) -> None:
+        class InterruptingAdapter(CliAgentAdapter):
+            adapter_type = "interrupting-route"
+
+            def execute(self, spec, prompt, working_directory):
+                raise KeyboardInterrupt
+
+        self.service.adapters.register(InterruptingAdapter())
+        self.service.register_agent(
+            AgentSpec(
+                agent_id="interrupting-primary",
+                display_name="Interrupting primary",
+                command=("unused",),
+                capabilities=("repo-read",),
+                provider_id="codex-cli",
+                adapter_type="interrupting-route",
+            )
+        )
+        marker = self.root / "backup-ran-after-interrupt"
+        self.register(
+            "codex-backup",
+            "from pathlib import Path; Path(%r).write_text('ran')" % str(marker),
+        )
+        task = self.create_routed_task("interrupting-primary", "codex-backup")
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.service.run_route(task.task_id, self.root)
+
+        persisted = self.store.get_task(task.task_id)
+        self.assertEqual(persisted.status, "blocked")
+        self.assertEqual(persisted.active_agent, "interrupting-primary")
+        self.assertEqual(persisted.actions[-1].status, "unknown")
         self.assertFalse(marker.exists())
 
     def test_unlaunchable_primary_is_skipped(self) -> None:
