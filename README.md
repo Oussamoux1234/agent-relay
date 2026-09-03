@@ -98,11 +98,11 @@ python3 -m agent_relay --state-dir .demo-relay handoff TASK_ID gemini-cli \
 ## Installation runbooks
 
 - [macOS native setup and operations](docs/runbook-macos.md)
-- [Windows setup and operations through WSL2](docs/runbook-windows.md)
+- [Windows native PowerShell and WSL2 setup](docs/runbook-windows.md)
 
-Native Windows Python is not currently supported because Relay's hardened state store
-depends on POSIX advisory locks and descriptor-relative filesystem operations. The
-Windows runbook uses WSL2 so those safety guarantees remain intact.
+Native Windows support is gated by the Windows CI matrix on Python 3.9–3.14. It uses
+a dedicated local NTFS/ReFS state backend and Windows Job Objects; WSL2 remains a
+supported alternative. See the runbook for native executable and volume constraints.
 
 ## Register a real or custom CLI
 
@@ -124,13 +124,13 @@ The example flag is illustrative; use the non-interactive invocation supported b
 
 Custom adapters still run with the user's operating-system permissions and can access the selected working directory. Relay coordinates agents; it is not itself an operating-system sandbox. Reviewed write presets also request the provider's bounded native permission mode. Captured stdout and stderr are bounded and returned to the invoking user, but are not added to the checkpoint ledger.
 
-Relay stores state outside the current repository by default: `${XDG_STATE_HOME:-$HOME/.local/state}/agent-relay` on Linux/WSL and `~/Library/Application Support/agent-relay` on macOS. `AGENT_RELAY_STATE_DIR` or `--state-dir` can select an existing safe location. A state root used with workspace-write must be disjoint from the authorized Git root: it cannot equal, contain, or be contained by that workspace. Relay checks this when authorization is created and again before execution, so an unsafe legacy authorization fails closed.
+Relay stores state outside the current repository by default: `${XDG_STATE_HOME:-$HOME/.local/state}/agent-relay` on Linux/WSL, `~/Library/Application Support/agent-relay` on macOS, and `%LOCALAPPDATA%\agent-relay` on native Windows. `AGENT_RELAY_STATE_DIR` or `--state-dir` can select an existing safe location. Native Windows state must be on a local fixed NTFS/ReFS volume. A state root used with workspace-write must be disjoint from the authorized Git root: it cannot equal, contain, or be contained by that workspace. Relay checks this when authorization is created and again before execution, so an unsafe legacy authorization fails closed.
 
 The default-location change does not move or delete an older state directory. Existing users can continue with `--state-dir /absolute/safe/state` or `AGENT_RELAY_STATE_DIR=/absolute/safe/state`. If the old state is inside a repository that will receive workspace-write access, first stop Relay activity and move that complete state directory to a location outside the repository; do not split or manually edit its managed files.
 
-The state store canonicalizes parent components but requires the selected state root itself, its managed `tasks` directory, and every managed JSON file to be real directories or regular files rather than symlinks. It keeps directory identities for the lifetime of the process and performs reads, temporary-file creation, replacement, and cleanup relative to verified directory descriptors. If a managed directory is replaced or the platform cannot provide the required safe path operations, Relay fails closed instead of following the new path.
+The state store canonicalizes parent components but requires the selected state root itself, its managed `tasks` directory, lock, and every managed JSON file to be real directories or regular files. POSIX uses verified directory descriptors and refuses symlinks. Native Windows refuses symlinks, junctions, and every other reparse point while checking managed file/directory identities around I/O. If a managed directory is replaced or the platform cannot provide the required safe path operations, Relay fails closed instead of following the new path.
 
-Every task, agent-registry, and health-registry mutation holds an exclusive operating-system lock on the owner-only `.relay.lock` file for its complete read–modify–write transaction. Separate Relay CLI processes on the same local filesystem therefore cannot both accept the same task revision or overwrite independent registry changes. Read-only commands remain lock-free because state files are replaced atomically. The lock is advisory—other programs must not edit Relay state directly—and is released automatically if a process exits. Atomic replacement prevents a partially written JSON file from becoming current; an interrupted pre-replacement temporary file may remain but is ignored. Existing state directories create the lock file on first use without a schema migration.
+Every task, agent-registry, and health-registry mutation holds an exclusive operating-system lock on `.relay.lock` for its complete read–modify–write transaction: `flock` on POSIX and native byte-range locking on Windows. Separate Relay CLI processes on the same local filesystem therefore cannot both accept the same task revision or overwrite independent registry changes. Read-only commands remain lock-free because state files are replaced atomically. The lock is advisory—other programs must not edit Relay state directly—and is released automatically if a process exits. Atomic same-directory replacement prevents a partially written JSON file from becoming current; an interrupted pre-replacement temporary file may remain but is ignored. Existing state directories create the lock file on first use without a schema migration.
 
 ## Built-in provider presets
 
@@ -321,7 +321,7 @@ python3 -m agent_relay workspace accept TASK_ID WRITE_ACTION_ID \
 
 If the run timed out, exited non-zero, lost protocol state, or could not be inspected afterward, its effects are ambiguous and the action always stays blocked. `resolve` cannot override a write-capable action. Restore only this action's changes without discarding pre-existing work, then let Relay verify that the complete pre-run snapshot is back:
 
-An interrupted Relay command terminates and reaps the provider process group before the interruption escapes. If the provider may have started, Relay first records the action as `unknown`; workspace-write actions also receive a post-run snapshot or an explicit unavailable review. Automatic routes never continue to a backup after an interruption.
+An interrupted Relay command terminates and reaps the complete provider process tree before the interruption escapes—using a POSIX process group or a Windows Job Object attached before the gated provider starts. If the provider may have started, Relay first records the action as `unknown`; workspace-write actions also receive a post-run snapshot or an explicit unavailable review. Automatic routes never continue to a backup after an interruption.
 
 ```bash
 python3 -m agent_relay workspace verify-rollback TASK_ID WRITE_ACTION_ID \
@@ -560,6 +560,8 @@ repository-read/network-denied sandbox to fail closed. Version 0.9.8 keeps compl
 workspace audits on disk while rendering bounded action history and deterministic
 review path samples into handoff prompts. Version 0.9.9 restores either a named or
 ownerless task owner after verified rollback and rejects missing or malformed owner
-records. New provider write presets will be added only when
+records. Version 0.10.0 adds native Windows state locking, reparse-point defenses,
+Job Object process-tree cleanup, PowerShell operations, and Windows CI across every
+supported Python version. New provider write presets will be added only when
 current official controls can preserve the same exact task/agent/root and review
 boundary.

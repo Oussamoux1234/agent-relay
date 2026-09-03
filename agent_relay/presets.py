@@ -274,7 +274,7 @@ PRESETS = {
 
 def _resolve_executable(name: str, explicit: Optional[str] = None) -> Optional[str]:
     candidate = explicit or name
-    if os.sep in candidate:
+    if os.sep in candidate or (os.altsep is not None and os.altsep in candidate):
         path = Path(candidate).expanduser().resolve()
         if path.is_file() and os.access(str(path), os.X_OK):
             return str(path)

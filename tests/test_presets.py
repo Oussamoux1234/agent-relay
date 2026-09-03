@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -282,6 +283,7 @@ class ProviderPresetTestCase(unittest.TestCase):
         self.assertNotIn("--allow-all-paths", arguments)
         self.assertNotIn("--allow-all-urls", arguments)
 
+    @unittest.skipIf(os.name == "nt", "fixture is a POSIX executable script")
     def test_copilot_execution_uses_ephemeral_fail_closed_configuration(self) -> None:
         self.service.register_agent(
             AgentSpec(
@@ -364,6 +366,7 @@ class ProviderPresetTestCase(unittest.TestCase):
         with self.assertRaises(ValidationError):
             CopilotCliAdapter().validate_execution(unsafe, "inspect", self.root)
 
+    @unittest.skipIf(os.name == "nt", "fixture is a POSIX executable script")
     def test_copilot_adapter_does_not_follow_auth_state_symlinks(self) -> None:
         source_home = self.root / "copilot-symlink-source"
         source_home.mkdir()
@@ -507,6 +510,7 @@ class ProviderPresetTestCase(unittest.TestCase):
                 )
                 self.assertEqual(PRESETS[preset_id].capabilities, ("repo-read",))
 
+    @unittest.skipIf(os.name == "nt", "fixture is a POSIX executable script")
     def test_provider_shaped_handoffs_complete_through_registry(self) -> None:
         self.service.register_agent(
             AgentSpec(
@@ -566,6 +570,7 @@ class ProviderPresetTestCase(unittest.TestCase):
 
         self.assertEqual(self.store.get_task(task.task_id).actions, [])
 
+    @unittest.skipIf(os.name == "nt", "fixture is a POSIX executable script")
     def test_two_instances_of_codex_and_claude_can_switch_with_isolated_config(self) -> None:
         cases = (
             ("codex-cli", "codex-primary", "codex-backup"),

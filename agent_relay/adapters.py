@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import stat
 import subprocess
 import tempfile
@@ -15,9 +14,31 @@ from typing import Dict, Optional, Protocol, Tuple, runtime_checkable
 
 from .errors import ConflictError, NotFoundError, ValidationError
 from .models import AgentSpec
+from .path_security import open_regular_read_only
+from .process_control import (
+    release_process_tree,
+    spawn_process,
+    terminate_process_tree,
+    validate_executable,
+)
 
 
-BASE_ENVIRONMENT_NAMES = ("HOME", "LANG", "LC_ALL", "PATH", "TERM", "TMPDIR")
+BASE_ENVIRONMENT_NAMES = (
+    "APPDATA",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LOCALAPPDATA",
+    "PATH",
+    "PATHEXT",
+    "SYSTEMROOT",
+    "TEMP",
+    "TERM",
+    "TMP",
+    "TMPDIR",
+    "USERPROFILE",
+    "WINDIR",
+)
 MAX_CAPTURED_OUTPUT_BYTES = 64 * 1024
 MAX_ARGUMENT_PROMPT_CHARACTERS = 32_000
 MAX_COPILOT_AUTH_STATE_BYTES = 2 * 1024 * 1024
@@ -149,55 +170,15 @@ class CliAgentAdapter:
 
     @staticmethod
     def _process_group_exists(process_group_id: int) -> bool:
-        try:
-            os.killpg(process_group_id, 0)
-            return True
-        except ProcessLookupError:
+        if os.name == "nt":
             return False
-        except PermissionError:
-            return True
+        from .process_control import _process_group_exists
+
+        return _process_group_exists(process_group_id)
 
     @staticmethod
     def _terminate_process_group(process: subprocess.Popen) -> None:
-        # The session leader may have exited while descendants remain alive. Signal the
-        # known process-group ID even when poll() already observed the leader's exit.
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        except OSError:
-            try:
-                process.terminate()
-            except OSError:
-                pass
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            pass
-        except (ChildProcessError, OSError):
-            pass
-
-        if CliAgentAdapter._process_group_exists(process.pid):
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except OSError:
-                try:
-                    process.kill()
-                except OSError:
-                    pass
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
-            except (ChildProcessError, OSError):
-                pass
-
-            deadline = time.monotonic() + 2
-            while (
-                CliAgentAdapter._process_group_exists(process.pid)
-                and time.monotonic() < deadline
-            ):
-                time.sleep(0.01)
+        terminate_process_tree(process)
 
     @staticmethod
     def validate_execution(spec: AgentSpec, prompt: str, working_directory: Path) -> Path:
@@ -213,6 +194,11 @@ class CliAgentAdapter:
                 "argument prompt exceeds %d characters; use stdin transport"
                 % MAX_ARGUMENT_PROMPT_CHARACTERS
             )
+        validate_executable(
+            spec.command,
+            resolved_directory,
+            CliAgentAdapter._environment(spec),
+        )
         return resolved_directory
 
     @staticmethod
@@ -232,14 +218,13 @@ class CliAgentAdapter:
             mode="w+b"
         ) as stderr_file:
             try:
-                process = subprocess.Popen(
+                process = spawn_process(
                     argv,
-                    cwd=str(working_directory),
-                    env=self._environment(spec),
-                    stdin=subprocess.PIPE if stdin_payload is not None else subprocess.DEVNULL,
-                    stdout=stdout_file,
-                    stderr=stderr_file,
-                    start_new_session=True,
+                    working_directory,
+                    self._environment(spec),
+                    subprocess.PIPE if stdin_payload is not None else subprocess.DEVNULL,
+                    stdout_file,
+                    stderr_file,
                 )
             except (FileNotFoundError, PermissionError, OSError) as exc:
                 elapsed_ms = int((time.monotonic() - start) * 1000)
@@ -270,6 +255,8 @@ class CliAgentAdapter:
                         process.stdin.close()
                     except (BrokenPipeError, OSError):
                         pass
+
+            release_process_tree(process)
 
             elapsed_ms = int((time.monotonic() - start) * 1000)
             stdout = self._read_tail(stdout_file)
@@ -343,7 +330,7 @@ class CopilotCliAdapter(CliAgentAdapter):
     def _source_config_home(spec: AgentSpec) -> Optional[Path]:
         if spec.config_home is not None:
             return Path(spec.config_home[1])
-        home = os.environ.get("HOME")
+        home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
         if not home:
             return None
         return Path(home) / ".copilot"
@@ -455,13 +442,8 @@ class CopilotCliAdapter(CliAgentAdapter):
         if source_home is None:
             return
         source = source_home / "config.json"
-        no_follow = getattr(os, "O_NOFOLLOW", None)
-        if no_follow is None:
-            return
-        flags = os.O_RDONLY | no_follow
-        try:
-            descriptor = os.open(str(source), flags)
-        except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
+        descriptor = open_regular_read_only(source)
+        if descriptor is None:
             return
         try:
             metadata = os.fstat(descriptor)

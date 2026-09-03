@@ -50,8 +50,9 @@ class RelayTestCase(unittest.TestCase):
         agents = self.store.list_agents()
 
         self.assertEqual([agent.agent_id for agent in agents], ["claude-code", "gemini-cli"])
-        registry_mode = (self.root / "state" / "agents.json").stat().st_mode & 0o777
-        self.assertEqual(registry_mode, 0o600)
+        if os.name != "nt":
+            registry_mode = (self.root / "state" / "agents.json").stat().st_mode & 0o777
+            self.assertEqual(registry_mode, 0o600)
 
     def test_rejects_invalid_agent_ids_and_empty_commands(self) -> None:
         with self.assertRaises(ValidationError):
@@ -174,6 +175,7 @@ class RelayTestCase(unittest.TestCase):
         self.assertEqual(outcome.task.status, "blocked")
         self.assertEqual(outcome.task.active_agent, "codex")
 
+    @unittest.skipIf(os.name == "nt", "covered by native Windows Job Object tests")
     def test_keyboard_interrupt_terminates_and_reaps_provider_group(self) -> None:
         adapter = CliAgentAdapter()
         descendant_pid = self.root / "descendant.pid"
