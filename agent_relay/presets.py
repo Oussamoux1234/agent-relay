@@ -55,7 +55,7 @@ PRESETS = {
         ),
         prompt_transport="stdin",
         capabilities=("repo-read",),
-        permission_profile="plan-read-only",
+        permission_profile="manual-plan-uncontained",
         adapter_type="antigravity-cli",
     ),
     "claude-code": AgentPreset(
@@ -187,7 +187,7 @@ PRESETS = {
         ),
         prompt_transport="stdin",
         capabilities=("repo-read",),
-        permission_profile="plan-read-only",
+        permission_profile="manual-plan-uncontained",
     ),
     "github-copilot": AgentPreset(
         preset_id="github-copilot",

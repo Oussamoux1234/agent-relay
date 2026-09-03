@@ -117,13 +117,12 @@ class WorkspaceReviewOutcome:
 
 AUTO_ROUTE_PROVIDER_IDS = frozenset(
     (
-        "antigravity-cli",
         "claude-code",
         "codex-cli",
-        "gemini-cli",
         "github-copilot",
     )
 )
+MANUAL_ONLY_PROVIDER_IDS = frozenset(("antigravity-cli", "gemini-cli"))
 WORKSPACE_WRITE_PROVIDER_IDS = frozenset(
     ("claude-code-write", "codex-cli-write", "codex-app-server-write")
 )
@@ -1064,6 +1063,12 @@ class RelayService:
     def _get_safe_routing_agent(self, agent_id: str) -> AgentSpec:
         spec = self.store.get_agent(agent_id)
         self.adapters.get(spec.adapter_type)
+        if spec.provider_id in MANUAL_ONLY_PROVIDER_IDS:
+            raise ValidationError(
+                "automatic routing is disabled for %s because its headless plan mode "
+                "does not enforce repository read-only access; use only an explicit "
+                "handoff inside an OS-enforced read-only environment" % agent_id
+            )
         if spec.provider_id not in AUTO_ROUTE_PROVIDER_IDS:
             raise ValidationError(
                 "automatic routing requires a supported built-in preset: %s" % agent_id

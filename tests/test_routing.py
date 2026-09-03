@@ -108,11 +108,11 @@ class RoutingTestCase(unittest.TestCase):
             "import sys; sys.stderr.write('unexpected failure'); raise SystemExit(2)",
         )
         self.register(
-            "gemini-backup",
+            "claude-backup",
             "from pathlib import Path; Path(%r).write_text('ran')" % str(marker),
-            provider_id="gemini-cli",
+            provider_id="claude-code",
         )
-        task = self.create_routed_task("codex-primary", "gemini-backup")
+        task = self.create_routed_task("codex-primary", "claude-backup")
 
         outcome = self.service.run_route(task.task_id, self.root)
 
@@ -289,6 +289,69 @@ class RoutingTestCase(unittest.TestCase):
             self.service.configure_route(task.task_id, ["codex-primary", "codex-primary"])
         with self.assertRaises(ValidationError):
             self.service.configure_route(task.task_id, ["generic", "codex-primary"])
+
+    def test_gemini_and_antigravity_are_rejected_from_automatic_routes(self) -> None:
+        for provider_id in ("gemini-cli", "antigravity-cli"):
+            with self.subTest(provider_id=provider_id):
+                suffix = provider_id.removesuffix("-cli")
+                primary = "codex-" + suffix
+                manual_only = suffix + "-manual"
+                self.register(primary, "print('primary')")
+                self.register(
+                    manual_only,
+                    "print('manual only')",
+                    provider_id=provider_id,
+                )
+                task = self.service.create_task(
+                    "Task",
+                    "Unsafe plan modes cannot enter automatic routes",
+                    active_agent=primary,
+                )
+
+                with self.assertRaisesRegex(
+                    ValidationError,
+                    "automatic routing is disabled",
+                ):
+                    self.service.configure_route(
+                        task.task_id,
+                        [primary, manual_only],
+                    )
+
+                persisted = self.store.get_task(task.task_id)
+                self.assertEqual(persisted.routing_order, [])
+                self.assertEqual(persisted.actions, [])
+
+    def test_legacy_route_with_manual_only_provider_fails_before_launch(self) -> None:
+        marker = self.root / "provider-ran"
+        self.register("codex-primary", "print('primary')")
+        self.register(
+            "gemini-manual",
+            "from pathlib import Path; Path(%r).write_text('ran')" % str(marker),
+            provider_id="gemini-cli",
+        )
+        task = self.service.create_task(
+            "Task",
+            "Existing unsafe routes fail closed after upgrade",
+            active_agent="codex-primary",
+        )
+        task.routing_order = ["codex-primary", "gemini-manual"]
+        task.__post_init__()
+        self.store.save_task(task, task.revision)
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            "automatic routing is disabled",
+        ):
+            self.service.preview_route(task.task_id)
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            "automatic routing is disabled",
+        ):
+            self.service.run_route(task.task_id, self.root)
+
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.store.get_task(task.task_id).actions, [])
 
     def test_old_checkpoint_without_routing_order_remains_compatible(self) -> None:
         self.register("codex-primary", "print('primary')")

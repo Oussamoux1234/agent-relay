@@ -20,7 +20,7 @@ The MVP answers one question: **can a user register arbitrary agents and move a 
 - Return a Codex App answer while retaining only safe thread/turn metadata and an explicit result proposal.
 - Record every handoff as pending before the target process starts.
 - Mark manual-handoff timeouts and non-zero exits as `unknown` and block further handoffs until the user resolves the outcome.
-- Configure an ordered route across Codex, Claude, Gemini, Antigravity, and GitHub Copilot preset instances.
+- Configure an ordered automatic route across currently eligible Codex, Claude, and GitHub Copilot preset instances.
 - Continue to the next read-only agent after a documented quota/rate-limit signal or a process that could not start.
 - Persist redacted health per agent instance and skip entries whose cooldown is still active.
 - Inspect or clear cooldowns and explicitly recover a task to an earlier route entry.
@@ -136,7 +136,7 @@ python3 -m agent_relay agent presets
 
 Read-only planning remains the default. Three separately named presets expose the opt-in write policy without changing their read counterparts:
 
-| Preset | Executable | Restricted mode |
+| Preset | Executable | Execution policy |
 | --- | --- | --- |
 | `codex-cli` | `codex` | ephemeral `exec` with a read-only sandbox |
 | `codex-app-server` | `codex` | one App Server turn with a read-only sandbox and no approvals |
@@ -144,8 +144,8 @@ Read-only planning remains the default. Three separately named presets expose th
 | `codex-app-server-write` | `codex` | one App Server turn, one writable root, no network or temporary-directory writes |
 | `claude-code` | `claude` | non-interactive plan mode |
 | `claude-code-write` | `claude` | restricted mode with repository file tools only; requires Claude Code 2.1.248+ |
-| `gemini-cli` | `gemini` | headless plan approval mode |
-| `antigravity-cli` | `agy` | plan mode with JSON-lines stdin |
+| `gemini-cli` | `gemini` | explicit handoff only; headless Plan Mode is not a read-only boundary |
+| `antigravity-cli` | `agy` | explicit handoff only; Plan Mode is not a read-only boundary |
 | `github-copilot` | `copilot` | non-interactive JSONL with only `view`, `glob`, and `grep` tools |
 
 Install and authenticate a provider through its own official workflow, then register only the presets you use:
@@ -162,7 +162,9 @@ python3 -m agent_relay agent add-preset github-copilot
 Every preset follows the same baseline:
 
 - The portable checkpoint travels over stdin and is never interpolated into a shell command.
-- Read presets use the provider's documented read-only or planning mode.
+- Automatic-route presets use reviewed provider controls; Gemini and Antigravity
+  plan presets remain manual-only because their headless modes do not enforce a
+  repository read-only boundary.
 - Write access requires a separately registered built-in write preset plus a task-specific authorization.
 - Relay reuses the CLI's local authentication and never stores provider tokens.
 - Dangerous auto-approval and permission-bypass flags are not enabled.
@@ -305,7 +307,7 @@ The Codex CLI write preset ignores user configuration and execution rules, reque
 
 The Claude write preset requires Claude Code 2.1.248 or newer and combines `--safe-mode`, `--restricted`, and `acceptEdits`. Its built-in tool set is limited to `Read`, `Edit`, `Write`, `Glob`, and `Grep`; Bash, web tools, slash commands, session persistence, MCP tools, and local customizations are excluded. Restricted mode ignores user and project settings and confines file tools to the working directory. An older CLI or any rejected flag produces a non-zero result that Relay treats as ambiguous and blocks for review.
 
-Gemini [`auto_edit`](https://geminicli.com/docs/reference/configuration/#approval-mode) and Antigravity [`accept-edits`](https://antigravity.google/docs/cli/modes/) were evaluated but do not yet have write presets. Their current [Gemini sandbox](https://geminicli.com/docs/cli/sandbox/) and [Antigravity permission](https://antigravity.google/docs/cli/permissions/) controls can still be widened by local or project settings and do not give Relay a verified, settings-independent exact-root boundary on every supported platform. They remain unchanged as read/plan presets. Relay also rejects custom registrations that claim the unapproved `gemini-cli-write` or `antigravity-cli-write` provider IDs.
+Gemini [`auto_edit`](https://geminicli.com/docs/reference/configuration/#approval-mode) and Antigravity [`accept-edits`](https://antigravity.google/docs/cli/modes/) were evaluated but do not yet have write presets. Their current [Gemini sandbox](https://geminicli.com/docs/cli/sandbox/) and [Antigravity permission](https://antigravity.google/docs/cli/permissions/) controls can still be widened by local or project settings and do not give Relay a verified, settings-independent exact-root boundary on every supported platform. Their plan presets may be used only through an explicit handoff; `route set`, route previews, and execution of stored routes reject them before launching a provider. Relay also rejects custom registrations that claim the unapproved `gemini-cli-write` or `antigravity-cli-write` provider IDs.
 
 All write presets are rejected by `route set`, so quota fallback remains read-only and an uncertain write can never trigger another agent automatically.
 
@@ -342,7 +344,6 @@ python3 -m agent_relay route set TASK_ID \
   --agent codex-primary \
   --agent codex-backup \
   --agent claude-primary \
-  --agent gemini-cli \
   --agent copilot-read
 
 python3 -m agent_relay route show TASK_ID
@@ -361,6 +362,14 @@ python3 -m agent_relay route run TASK_ID --execute --cwd .
 ```
 
 Relay invokes the active CLI agent first. If that process exits with a recognized quota or rate-limit signal, Relay records a redacted failure class and immediately invokes the next candidate with the shared checkpoint. A process that cannot be launched is also skipped safely because it could not have performed work. A successful candidate becomes the task's active agent; later runs start there and continue only through the remaining route entries.
+
+Automatic routes currently accept only `codex-cli`, `claude-code`, and
+`github-copilot` provider registrations. Gemini and Antigravity can still be
+registered and invoked by an explicit, previewed handoff, but their headless plan
+modes may allow workspace changes. Run those manual handoffs only inside an
+OS-enforced read-only environment until Relay ships a tested containment boundary.
+Existing routes containing either provider fail closed during preview or execution
+before any route candidate is launched.
 
 Each failed instance also receives a record in the owner-only `health.json` registry. Before a route starts, Relay takes one deterministic snapshot of the remaining entries and omits every active cooldown. It visits each eligible entry at most once, never sleeps inside the route, and returns a conflict without launching anything when every remaining entry is cooling down.
 
@@ -462,7 +471,7 @@ The GitHub Actions workflow runs the same suite on Python 3.9 through 3.14 with 
 
 - Manual handoffs, including Codex App Server turns, remain user-confirmed; ordered CLI routes can automatically continue only after conservative limit classification.
 - The adapter launches CLI processes but does not scrape or impersonate consumer subscriptions.
-- Read-only or plan-only presets remain the default; write access supports only the separately named Codex CLI, Codex App Server, and restricted Claude Code write presets. Gemini, Antigravity, and GitHub Copilot remain read/plan-only.
+- Read-only presets remain the default; write access supports only the separately named Codex CLI, Codex App Server, and restricted Claude Code write presets. Gemini and Antigravity are manual-only because their plan modes are not hard read-only boundaries. GitHub Copilot remains eligible for read routing subject to the documented hook-containment limitation.
 - Codex App integration is limited to documented local App Server stdio calls; live desktop UI control, task discovery, WebSocket transport, and automatic app routing are not implemented.
 - Workspace review records content-free Git state metadata, not raw patch contents; the user must inspect the real Git diff before acceptance.
 - Structured result fields and reported tests remain agent claims; Relay does not independently execute tests.
@@ -478,6 +487,7 @@ Agent Relay is licensed under the [Apache License 2.0](LICENSE).
 
 ## Roadmap
 
-GitHub Education/Copilot read-only support is delivered in v0.9.0. New provider
-write presets will be added only when current official controls can preserve the
-same exact task/agent/root and review boundary.
+GitHub Education/Copilot read routing is delivered in v0.9.0. Version 0.9.1
+removes Gemini and Antigravity from automatic routes until hard containment is
+available. New provider write presets will be added only when current official
+controls can preserve the same exact task/agent/root and review boundary.

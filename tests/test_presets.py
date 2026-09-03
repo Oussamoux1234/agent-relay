@@ -222,13 +222,11 @@ class ProviderPresetTestCase(unittest.TestCase):
             ("CLAUDE_CONFIG_DIR", str(config_home.resolve())),
         )
 
-    def test_existing_read_presets_remain_read_only(self) -> None:
+    def test_automatic_route_presets_remain_read_only(self) -> None:
         for preset_id in (
-            "antigravity-cli",
             "claude-code",
             "codex-cli",
             "codex-app-server",
-            "gemini-cli",
             "github-copilot",
         ):
             with self.subTest(preset_id=preset_id):
@@ -237,6 +235,15 @@ class ProviderPresetTestCase(unittest.TestCase):
                     PRESETS[preset_id].permission_profile,
                     "workspace-write",
                 )
+
+    def test_uncontained_plan_presets_are_labeled_manual_only(self) -> None:
+        for preset_id in ("antigravity-cli", "gemini-cli"):
+            with self.subTest(preset_id=preset_id):
+                self.assertEqual(
+                    PRESETS[preset_id].permission_profile,
+                    "manual-plan-uncontained",
+                )
+                self.assertEqual(PRESETS[preset_id].capabilities, ("repo-read",))
 
     def test_provider_shaped_handoffs_complete_through_registry(self) -> None:
         self.service.register_agent(
