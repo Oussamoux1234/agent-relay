@@ -13,6 +13,7 @@ from .adapters import (
     AgentExecutionResult,
     AntigravityCliAdapter,
     CliAgentAdapter,
+    CopilotCliAdapter,
     SessionAgentAdapter,
 )
 from .app_server import CodexAppServerAdapter
@@ -158,6 +159,7 @@ class RelayService:
             self.adapters.register(self.adapter)
             if adapter is None:
                 self.adapters.register(AntigravityCliAdapter())
+                self.adapters.register(CopilotCliAdapter())
                 self.adapters.register(CodexAppServerAdapter())
         else:
             self.adapter = None

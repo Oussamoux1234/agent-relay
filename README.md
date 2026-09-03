@@ -152,7 +152,7 @@ Read-only planning remains the default. Three separately named presets expose th
 | `claude-code-write` | `claude` | restricted mode with repository file tools only; requires Claude Code 2.1.248+ |
 | `gemini-cli` | `gemini` | explicit handoff only; headless Plan Mode is not a read-only boundary |
 | `antigravity-cli` | `agy` | explicit handoff only; Plan Mode is not a read-only boundary |
-| `github-copilot` | `copilot` | non-interactive JSONL with only `view`, `glob`, and `grep` tools |
+| `github-copilot` | `copilot` | isolated config plus fail-closed local sandbox; contained repository reads only; requires Copilot CLI 1.0.79+ |
 
 Install and authenticate a provider through its own official workflow, then register only the presets you use:
 
@@ -218,13 +218,15 @@ This is a supported protocol integration, not desktop UI automation. Relay does 
 
 ### GitHub Copilot and GitHub Education
 
-The `github-copilot` preset is an active read-only fallback adapter. It sends the
-checkpoint through stdin, requests JSONL output, and makes only Copilot's `view`,
-`glob`, and `grep` tools available. It also denies write, shell, URL, and memory
-permissions and disables built-in MCP, custom instructions, experimental behavior,
-remote sessions, remote export, temporary-directory access, prompts, automatic
-updates, and session logging. GitHub documents the underlying
-[tool allowlist and deny rules](https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/allowing-tools).
+The `github-copilot` preset is an active, contained repository-read fallback for
+GitHub Copilot CLI 1.0.79 or newer. A dedicated adapter creates a fresh private
+configuration and cache for every run, copies only bounded authentication state,
+and exposes only Copilot's `view`, `glob`, and `grep` tools. It denies every write,
+shell, PowerShell, URL, memory, subagent, and web-fetch surface; disables built-in
+MCP, custom instructions, remote sessions, remote export, and sandbox bypass; and
+requires Copilot's OS-backed local sandbox to start successfully. The sandbox
+grants the canonical repository read-only, grants no writable path, withholds
+Git/`gh`/Keychain credentials from tools, and blocks child-process network access.
 
 Install and authenticate the official CLI first, then register it:
 
@@ -238,6 +240,14 @@ store, mint, refresh, or choose GitHub tokens. Authentication or organization-po
 errors fail closed. The preset recognizes GitHub's documented rate-limit wording as
 transient and exhausted AI credits as quota exhaustion; neither classification
 changes, extends, or bypasses the user's GitHub plan.
+
+Relay disables repository, user, and plugin hooks for these programmatic runs and
+isolates saved folder trust. GitHub's administrator-installed policy hooks are an
+explicit trusted-computing-base exception: GitHub says they are machine-wide and
+cannot be disabled by `disableAllHooks`. Local sandboxing is also a public-preview
+feature. Read the exact threat model and run the authenticated host fixture in
+[the Copilot containment guide](docs/copilot-containment.md) before calling a
+specific host/version combination hard read-only.
 
 GitHub Education is an entitlement managed entirely by GitHub, not a Relay feature.
 Verified students can activate Copilot Student from their
@@ -497,12 +507,13 @@ PYTHONPYCACHEPREFIX=/tmp/agent-relay-pycache python3 -m unittest discover -v
 The GitHub Actions workflow runs the same suite on Python 3.9 through 3.14 with read-only repository permissions.
 When Codex CLI is installed, the native containment test invokes `codex sandbox` directly, proves that a file inside the temporary workspace is readable, and proves that a sibling file is not. It skips only when Codex is absent or the current host forbids a nested native sandbox.
 The authenticated Claude native fixture is opt-in because it makes one real model request. Set `AGENT_RELAY_RUN_CLAUDE_NATIVE_TESTS=1` before running `python3 -m unittest tests.test_claude_native -v`; it plants a sibling secret plus malicious project instructions, a session hook, and an MCP server, then verifies that restricted safe mode reads only the in-workspace probe and activates none of those customizations.
+The authenticated Copilot native fixture is also opt-in. Set `AGENT_RELAY_RUN_COPILOT_NATIVE_TESTS=1` before running `python3 -m unittest tests.test_copilot_native -v`; it verifies that a sibling secret is unreadable and that a hostile repository `sessionStart` hook cannot write inside or outside the workspace.
 
 ## Deliberate MVP boundaries
 
 - Manual handoffs, including Codex App Server turns, remain user-confirmed; ordered CLI routes can automatically continue only after conservative limit classification.
 - The adapter launches CLI processes but does not scrape or impersonate consumer subscriptions.
-- Read-only presets remain the default; write access supports only the separately named Codex CLI, Codex App Server, and restricted Claude Code write presets. Gemini and Antigravity are manual-only because their plan modes are not hard read-only boundaries. GitHub Copilot remains eligible for read routing subject to the documented hook-containment limitation.
+- Read-only presets remain the default; write access supports only the separately named Codex CLI, Codex App Server, and restricted Claude Code write presets. Gemini and Antigravity are manual-only because their plan modes are not hard read-only boundaries. GitHub Copilot remains eligible for contained read routing, but its local sandbox is public preview and administrator policy hooks remain trusted host code; the exact host image needs the native fixture before claiming a hard guarantee.
 - Codex App integration is limited to documented local App Server stdio calls; live desktop UI control, task discovery, WebSocket transport, and automatic app routing are not implemented.
 - Workspace review records content-free Git state metadata, not raw patch contents; the user must inspect the real Git diff before acceptance.
 - Structured result fields and reported tests remain agent claims; Relay does not independently execute tests.
@@ -528,6 +539,8 @@ automatic fallback. Version 0.9.5 restricts Codex CLI and App Server reads to th
 active workspace plus platform-minimal paths and disables external tool surfaces
 independently from command-network isolation. Version 0.9.6 confines Claude read
 handoffs with restricted and safe modes, a read-only tool allowlist, and no local
-customizations or persistence. New provider write presets will be added only when
+customizations or persistence. Version 0.9.7 gives Copilot a dedicated ephemeral
+adapter, disables untrusted hooks and configuration, and requires its OS-backed
+repository-read/network-denied sandbox to fail closed. New provider write presets will be added only when
 current official controls can preserve the same exact task/agent/root and review
 boundary.

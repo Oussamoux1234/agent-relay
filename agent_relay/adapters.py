@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import stat
 import subprocess
 import tempfile
 import time
@@ -19,6 +20,29 @@ from .models import AgentSpec
 BASE_ENVIRONMENT_NAMES = ("HOME", "LANG", "LC_ALL", "PATH", "TERM", "TMPDIR")
 MAX_CAPTURED_OUTPUT_BYTES = 64 * 1024
 MAX_ARGUMENT_PROMPT_CHARACTERS = 32_000
+MAX_COPILOT_AUTH_STATE_BYTES = 2 * 1024 * 1024
+MAX_COPILOT_AUTH_ACCOUNTS = 64
+MAX_COPILOT_AUTH_IDENTITY_CHARACTERS = 1_024
+MAX_COPILOT_AUTH_TOKEN_CHARACTERS = 32_768
+
+COPILOT_CONTAINMENT_ARGUMENTS = (
+    "-s",
+    "--available-tools=view,glob,grep",
+    "--deny-tool=write,create,edit,shell,powershell,url,memory,task,web_fetch",
+    "--disable-builtin-mcps",
+    "--no-custom-instructions",
+    "--experimental",
+    "--sandbox",
+    "--no-remote",
+    "--no-remote-export",
+    "--disallow-temp-dir",
+    "--no-ask-user",
+    "--no-auto-update",
+    "--no-bash-env",
+    "--no-color",
+    "--log-level=none",
+    "--output-format=json",
+)
 
 
 @dataclass(frozen=True)
@@ -289,3 +313,276 @@ class AntigravityCliAdapter(CliAgentAdapter):
         message = {"event": "user", "message": {"content": prompt}}
         payload = (json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8")
         return list(spec.command), payload
+
+
+class CopilotCliAdapter(CliAgentAdapter):
+    """Run Copilot with ephemeral configuration and a fail-closed read sandbox."""
+
+    adapter_type = "copilot-cli"
+
+    @staticmethod
+    def validate_execution(spec: AgentSpec, prompt: str, working_directory: Path) -> Path:
+        resolved = CliAgentAdapter.validate_execution(spec, prompt, working_directory)
+        if spec.prompt_transport != "stdin":
+            raise ValidationError("GitHub Copilot CLI requires stdin prompt transport")
+        if spec.provider_id != "github-copilot":
+            raise ValidationError("Copilot adapter requires the reviewed provider preset")
+        if spec.command[1:] != COPILOT_CONTAINMENT_ARGUMENTS:
+            raise ValidationError("Copilot containment arguments do not match the reviewed preset")
+        if spec.capabilities != ("repo-read",):
+            raise ValidationError("Copilot containment requires repo-read capability only")
+        if spec.permission_profile != "sandbox-read-contained-preview":
+            raise ValidationError("Copilot containment requires its reviewed permission profile")
+        if spec.env_allowlist:
+            raise ValidationError("Copilot containment does not allow inherited environment values")
+        if spec.config_home is not None and spec.config_home[0] != "COPILOT_HOME":
+            raise ValidationError("Copilot source configuration must use COPILOT_HOME")
+        return resolved
+
+    @staticmethod
+    def _source_config_home(spec: AgentSpec) -> Optional[Path]:
+        if spec.config_home is not None:
+            return Path(spec.config_home[1])
+        home = os.environ.get("HOME")
+        if not home:
+            return None
+        return Path(home) / ".copilot"
+
+    @staticmethod
+    def _strip_jsonc_comments(value: str) -> str:
+        output = []
+        index = 0
+        in_string = False
+        escaped = False
+        while index < len(value):
+            character = value[index]
+            if in_string:
+                output.append(character)
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == '"':
+                    in_string = False
+                index += 1
+                continue
+            if character == '"':
+                in_string = True
+                output.append(character)
+                index += 1
+                continue
+            if character == "/" and index + 1 < len(value):
+                following = value[index + 1]
+                if following == "/":
+                    index += 2
+                    while index < len(value) and value[index] not in "\r\n":
+                        index += 1
+                    continue
+                if following == "*":
+                    index += 2
+                    while index + 1 < len(value):
+                        if value[index] == "*" and value[index + 1] == "/":
+                            index += 2
+                            break
+                        index += 1
+                    continue
+            output.append(character)
+            index += 1
+        return "".join(output)
+
+    @staticmethod
+    def _auth_identity(value: object) -> Optional[Dict[str, str]]:
+        if not isinstance(value, dict):
+            return None
+        identity = {}
+        for key in ("host", "login"):
+            item = value.get(key)
+            if not isinstance(item, str) or not item:
+                return None
+            if len(item) > MAX_COPILOT_AUTH_IDENTITY_CHARACTERS:
+                return None
+            identity[key] = item
+        return identity
+
+    @classmethod
+    def _sanitized_auth_state(cls, payload: bytes) -> Optional[bytes]:
+        try:
+            decoded = payload.decode("utf-8")
+            parsed = json.loads(cls._strip_jsonc_comments(decoded))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(parsed, dict):
+            return None
+
+        sanitized: Dict[str, object] = {}
+        last_user = cls._auth_identity(parsed.get("lastLoggedInUser"))
+        if last_user is not None:
+            sanitized["lastLoggedInUser"] = last_user
+
+        logged_in_users = parsed.get("loggedInUsers")
+        if isinstance(logged_in_users, list):
+            identities = []
+            for value in logged_in_users[:MAX_COPILOT_AUTH_ACCOUNTS]:
+                identity = cls._auth_identity(value)
+                if identity is not None:
+                    identities.append(identity)
+            if identities:
+                sanitized["loggedInUsers"] = identities
+
+        tokens = parsed.get("copilotTokens")
+        if isinstance(tokens, dict):
+            safe_tokens = {}
+            for key, value in list(tokens.items())[:MAX_COPILOT_AUTH_ACCOUNTS]:
+                if (
+                    isinstance(key, str)
+                    and isinstance(value, str)
+                    and key
+                    and value
+                    and len(key) <= MAX_COPILOT_AUTH_IDENTITY_CHARACTERS
+                    and len(value) <= MAX_COPILOT_AUTH_TOKEN_CHARACTERS
+                ):
+                    safe_tokens[key] = value
+            if safe_tokens:
+                sanitized["copilotTokens"] = safe_tokens
+
+        if not sanitized:
+            return None
+        return json.dumps(sanitized, sort_keys=True).encode("utf-8")
+
+    @classmethod
+    def _copy_auth_state(cls, spec: AgentSpec, isolated_home: Path) -> None:
+        source_home = CopilotCliAdapter._source_config_home(spec)
+        if source_home is None:
+            return
+        source = source_home / "config.json"
+        no_follow = getattr(os, "O_NOFOLLOW", None)
+        if no_follow is None:
+            return
+        flags = os.O_RDONLY | no_follow
+        try:
+            descriptor = os.open(str(source), flags)
+        except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
+            return
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                return
+            if metadata.st_size > MAX_COPILOT_AUTH_STATE_BYTES:
+                return
+            chunks = []
+            remaining = MAX_COPILOT_AUTH_STATE_BYTES + 1
+            while remaining:
+                chunk = os.read(descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            payload = b"".join(chunks)
+            if len(payload) > MAX_COPILOT_AUTH_STATE_BYTES:
+                return
+        finally:
+            os.close(descriptor)
+
+        payload = cls._sanitized_auth_state(payload)
+        if payload is None:
+            return
+        target = isolated_home / "config.json"
+        target.write_bytes(payload)
+        target.chmod(0o600)
+
+    @staticmethod
+    def _settings(working_directory: Path) -> Dict[str, object]:
+        return {
+            "disableAllHooks": True,
+            "experimental": True,
+            "remote": "off",
+            "remoteExport": False,
+            "permissions": {"disableBypassPermissionsMode": "disable"},
+            "sandbox": {
+                "enabled": True,
+                "failIfUnavailable": True,
+                "allowBypass": False,
+                "addCurrentWorkingDirectory": False,
+                "allowDevToolAccess": False,
+                "sandboxMcpServers": True,
+                "sandboxLspServers": True,
+                "auth": {"git": False, "gh": False},
+                "userPolicy": {
+                    "filesystem": {
+                        "readwritePaths": [],
+                        "readonlyPaths": [str(working_directory)],
+                        "deniedPaths": [],
+                        "clearPolicyOnExit": True,
+                    },
+                    "network": {
+                        "allowOutbound": False,
+                        "allowLocalNetwork": False,
+                    },
+                    "seatbelt": {"keychainAccess": False},
+                },
+            },
+        }
+
+    @staticmethod
+    def _environment(spec: AgentSpec) -> Dict[str, str]:
+        environment = CliAgentAdapter._environment(spec)
+        if spec.config_home is None:
+            raise ValidationError("Copilot containment requires an isolated configuration home")
+        isolated_home = Path(spec.config_home[1])
+        environment.update(
+            {
+                "COPILOT_ALLOW_ALL": "false",
+                "COPILOT_AUTO_UPDATE": "false",
+                "COPILOT_CACHE_HOME": str(isolated_home / "cache"),
+                "GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS": "false",
+                "GITHUB_COPILOT_PROMPT_MODE_REPO_HOOKS": "false",
+                "GITHUB_COPILOT_PROMPT_MODE_WORKSPACE_MCP": "false",
+                "PLUGINS_DASHBOARD": "false",
+            }
+        )
+        return environment
+
+    def execute(self, spec: AgentSpec, prompt: str, working_directory: Path) -> AgentExecutionResult:
+        working_directory = self.validate_execution(spec, prompt, working_directory)
+        try:
+            with tempfile.TemporaryDirectory(prefix="agent-relay-copilot-") as temporary:
+                isolated_home = Path(temporary)
+                isolated_home.chmod(0o700)
+                cache_home = isolated_home / "cache"
+                cache_home.mkdir(mode=0o700)
+                self._copy_auth_state(spec, isolated_home)
+                settings_path = isolated_home / "settings.json"
+                settings_path.write_text(
+                    json.dumps(self._settings(working_directory), sort_keys=True),
+                    encoding="utf-8",
+                )
+                settings_path.chmod(0o600)
+                isolated_spec = AgentSpec(
+                    agent_id=spec.agent_id,
+                    display_name=spec.display_name,
+                    command=spec.command,
+                    prompt_transport=spec.prompt_transport,
+                    timeout_seconds=spec.timeout_seconds,
+                    capabilities=spec.capabilities,
+                    env_allowlist=spec.env_allowlist,
+                    adapter_type=spec.adapter_type,
+                    config_home=("COPILOT_HOME", str(isolated_home)),
+                    provider_id=spec.provider_id,
+                    permission_profile=spec.permission_profile,
+                )
+                return super().execute(
+                    isolated_spec,
+                    prompt,
+                    working_directory,
+                )
+        except OSError as exc:
+            return AgentExecutionResult(
+                status="failed",
+                return_code=None,
+                stdout="",
+                stderr="",
+                elapsed_ms=0,
+                started=False,
+                error="could not prepare isolated Copilot configuration: %s"
+                % type(exc).__name__,
+            )
