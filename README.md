@@ -122,6 +122,10 @@ The example flag is illustrative; use the non-interactive invocation supported b
 
 Custom adapters still run with the user's operating-system permissions and can access the selected working directory. Relay coordinates agents; it is not itself an operating-system sandbox. Reviewed write presets also request the provider's bounded native permission mode. Captured stdout and stderr are bounded and returned to the invoking user, but are not added to the checkpoint ledger.
 
+Relay stores state outside the current repository by default: `${XDG_STATE_HOME:-$HOME/.local/state}/agent-relay` on Linux/WSL and `~/Library/Application Support/agent-relay` on macOS. `AGENT_RELAY_STATE_DIR` or `--state-dir` can select an existing safe location. A state root used with workspace-write must be disjoint from the authorized Git root: it cannot equal, contain, or be contained by that workspace. Relay checks this when authorization is created and again before execution, so an unsafe legacy authorization fails closed.
+
+The default-location change does not move or delete an older state directory. Existing users can continue with `--state-dir /absolute/safe/state` or `AGENT_RELAY_STATE_DIR=/absolute/safe/state`. If the old state is inside a repository that will receive workspace-write access, first stop Relay activity and move that complete state directory to a location outside the repository; do not split or manually edit its managed files.
+
 The state store canonicalizes parent components but requires the selected state root itself, its managed `tasks` directory, and every managed JSON file to be real directories or regular files rather than symlinks. It keeps directory identities for the lifetime of the process and performs reads, temporary-file creation, replacement, and cleanup relative to verified directory descriptors. If a managed directory is replaced or the platform cannot provide the required safe path operations, Relay fails closed instead of following the new path.
 
 Every task, agent-registry, and health-registry mutation holds an exclusive operating-system lock on the owner-only `.relay.lock` file for its complete read–modify–write transaction. Separate Relay CLI processes on the same local filesystem therefore cannot both accept the same task revision or overwrite independent registry changes. Read-only commands remain lock-free because state files are replaced atomically. The lock is advisory—other programs must not edit Relay state directly—and is released automatically if a process exits. Atomic replacement prevents a partially written JSON file from becoming current; an interrupted pre-replacement temporary file may remain but is ignored. Existing state directories create the lock file on first use without a schema migration.
@@ -258,7 +262,7 @@ python3 -m agent_relay workspace authorize TASK_ID codex-writer \
   --root /absolute/path/to/repository
 ```
 
-Authorization fails unless the path is the exact top level of an existing Git repository. It is recorded as a `workspace-write-authorize` action scoped to the task, agent ID, and canonical root. It does not authorize a different task, a second provider registration, a subdirectory, or another repository.
+Authorization fails unless the path is the exact top level of an existing Git repository and Relay's state directory is outside and disjoint from it. It is recorded as a `workspace-write-authorize` action scoped to the task, agent ID, and canonical root. It does not authorize a different task, a second provider registration, a subdirectory, or another repository.
 
 Preview and execute the handoff normally, using that same root as the working directory:
 
@@ -489,5 +493,7 @@ Agent Relay is licensed under the [Apache License 2.0](LICENSE).
 
 GitHub Education/Copilot read routing is delivered in v0.9.0. Version 0.9.1
 removes Gemini and Antigravity from automatic routes until hard containment is
-available. New provider write presets will be added only when current official
-controls can preserve the same exact task/agent/root and review boundary.
+available. Version 0.9.2 moves default state outside repositories and rejects
+state/workspace overlap for write-authorized tasks. New provider write presets will
+be added only when current official controls can preserve the same exact
+task/agent/root and review boundary.

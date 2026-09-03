@@ -11,7 +11,7 @@ from pathlib import Path
 
 from agent_relay.cli import main
 from agent_relay.errors import ConflictError, ValidationError
-from agent_relay.models import AgentSpec
+from agent_relay.models import ActionRecord, AgentSpec
 from agent_relay.presets import build_preset
 from agent_relay.service import RelayService
 from agent_relay.storage import RelayStore
@@ -306,6 +306,117 @@ class WorkspaceServiceTestCase(unittest.TestCase):
                 self.workspace / "not-the-root",
             )
         self.assertEqual(self.store.get_task(task.task_id).actions, [])
+
+    def test_authorization_rejects_state_inside_workspace(self) -> None:
+        unsafe_service = RelayService(RelayStore(self.workspace / ".relay-state"))
+        unsafe_service.register_agent(
+            AgentSpec(
+                agent_id="writer",
+                display_name="Writer",
+                command=(sys.executable, "-c", WRITE_SCRIPT, "success"),
+                capabilities=("repo-read", "repo-write"),
+                provider_id="codex-cli-write",
+                permission_profile="workspace-write",
+            )
+        )
+        task = unsafe_service.create_task("Unsafe state", "Reject overlapping state")
+
+        with self.assertRaisesRegex(ValidationError, "outside and disjoint"):
+            unsafe_service.authorize_workspace(task.task_id, "writer", self.workspace)
+
+        self.assertEqual(unsafe_service.store.get_task(task.task_id).actions, [])
+
+    def test_authorization_rejects_workspace_inside_state(self) -> None:
+        state = self.root / "containing-state"
+        unsafe_service = RelayService(RelayStore(state))
+        nested_workspace = state / "repository"
+        nested_workspace.mkdir()
+        subprocess.run(
+            ["git", "-C", str(nested_workspace), "init", "-q"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        unsafe_service.register_agent(
+            AgentSpec(
+                agent_id="writer",
+                display_name="Writer",
+                command=(sys.executable, "-c", WRITE_SCRIPT, "success"),
+                capabilities=("repo-read", "repo-write"),
+                provider_id="codex-cli-write",
+                permission_profile="workspace-write",
+            )
+        )
+        task = unsafe_service.create_task("Unsafe workspace", "Reject overlapping state")
+
+        with self.assertRaisesRegex(ValidationError, "outside and disjoint"):
+            unsafe_service.authorize_workspace(
+                task.task_id,
+                "writer",
+                nested_workspace,
+            )
+
+        self.assertEqual(unsafe_service.store.get_task(task.task_id).actions, [])
+
+    def test_authorization_rejects_state_equal_to_workspace(self) -> None:
+        workspace = self.root / "state-is-workspace"
+        workspace.mkdir()
+        subprocess.run(
+            ["git", "-C", str(workspace), "init", "-q"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        unsafe_service = RelayService(RelayStore(workspace))
+        unsafe_service.register_agent(
+            AgentSpec(
+                agent_id="writer",
+                display_name="Writer",
+                command=(sys.executable, "-c", WRITE_SCRIPT, "success"),
+                capabilities=("repo-read", "repo-write"),
+                provider_id="codex-cli-write",
+                permission_profile="workspace-write",
+            )
+        )
+        task = unsafe_service.create_task("Same root", "Reject overlapping state")
+
+        with self.assertRaisesRegex(ValidationError, "outside and disjoint"):
+            unsafe_service.authorize_workspace(task.task_id, "writer", workspace)
+
+    def test_legacy_overlapping_authorization_is_rechecked_before_execution(self) -> None:
+        unsafe_service = RelayService(RelayStore(self.workspace / ".legacy-relay"))
+        unsafe_service.register_agent(
+            AgentSpec(
+                agent_id="writer",
+                display_name="Writer",
+                command=(sys.executable, "-c", WRITE_SCRIPT, "success"),
+                capabilities=("repo-read", "repo-write"),
+                provider_id="codex-cli-write",
+                permission_profile="workspace-write",
+            )
+        )
+        task = unsafe_service.create_task("Legacy authorization", "Fail closed")
+        timestamp = "2026-09-03T12:00:00Z"
+        task.actions.append(
+            ActionRecord(
+                action_id="a" * 32,
+                kind="workspace-write-authorize",
+                agent_id="writer",
+                status="completed",
+                started_at=timestamp,
+                finished_at=timestamp,
+                details={
+                    "workspace_root": str(self.workspace.resolve()),
+                    "scope": "exact-task-agent-git-root",
+                },
+            )
+        )
+        task = unsafe_service.store.save_task(task, task.revision)
+
+        with self.assertRaisesRegex(ValidationError, "outside and disjoint"):
+            unsafe_service.preview_handoff(task.task_id, "writer")
 
     def test_authorization_is_task_agent_specific_and_revocable(self) -> None:
         first = self.new_task()

@@ -34,6 +34,25 @@ class RelayStore:
         self._tasks_identity = self._ensure_private_child_directory("tasks")
         self._lock_identity = self._ensure_transaction_lock()
 
+    def require_disjoint_workspace(self, workspace_root: Path) -> None:
+        """Reject a write scope that overlaps Relay's trusted state directory."""
+
+        try:
+            canonical_workspace = Path(workspace_root).resolve(strict=True)
+            canonical_state = self.root.resolve(strict=True)
+        except OSError as exc:
+            raise ValidationError(
+                "state and workspace roots must be available for isolation validation"
+            ) from exc
+        if (
+            canonical_state == canonical_workspace
+            or canonical_state.is_relative_to(canonical_workspace)
+            or canonical_workspace.is_relative_to(canonical_state)
+        ):
+            raise ValidationError(
+                "Relay state must be outside and disjoint from an authorized workspace"
+            )
+
     @staticmethod
     def _directory_flags() -> int:
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)

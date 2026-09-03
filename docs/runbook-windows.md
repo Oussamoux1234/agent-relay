@@ -240,6 +240,10 @@ PYTHONPYCACHEPREFIX=/tmp/agent-relay-pycache python -m unittest discover -v
   solely to work around a benefit that is still being applied.
 - **Root rejected:** use the exact Linux path from `git rev-parse --show-toplevel`,
   never a `C:\...` path.
+- **State directory rejected:** inside WSL the default is
+  `${XDG_STATE_HOME:-$HOME/.local/state}/agent-relay`. Keep it outside and disjoint
+  from every Git root authorized for workspace writes, and do not replace managed
+  paths with symlinks.
 - **Claude rejects `--restricted`:** upgrade Claude Code to 2.1.248 or newer; never
   substitute a permission-bypass flag.
 - **Codex App confusion:** Relay starts its own local `codex app-server` subprocess
