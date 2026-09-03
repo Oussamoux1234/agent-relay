@@ -331,6 +331,11 @@ python3 -m agent_relay workspace verify-rollback TASK_ID WRITE_ACTION_ID \
 
 Relay supplies rollback guidance but never deletes files, resets Git history, or performs rollback itself. You can revoke future use of the grant after all write reviews are resolved:
 
+A verified rollback restores the exact `active_agent` recorded before the write,
+including an ownerless task represented by JSON `null`. Legacy or manually edited
+write actions that omit `source_agent`, or store a value other than a string or
+`null`, fail closed because Relay cannot safely infer the earlier owner.
+
 ```bash
 python3 -m agent_relay workspace revoke TASK_ID codex-writer
 ```
@@ -553,6 +558,8 @@ customizations or persistence. Version 0.9.7 gives Copilot a dedicated ephemeral
 adapter, disables untrusted hooks and configuration, and requires its OS-backed
 repository-read/network-denied sandbox to fail closed. Version 0.9.8 keeps complete
 workspace audits on disk while rendering bounded action history and deterministic
-review path samples into handoff prompts. New provider write presets will be added only when
+review path samples into handoff prompts. Version 0.9.9 restores either a named or
+ownerless task owner after verified rollback and rejects missing or malformed owner
+records. New provider write presets will be added only when
 current official controls can preserve the same exact task/agent/root and review
 boundary.

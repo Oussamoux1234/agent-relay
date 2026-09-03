@@ -641,6 +641,68 @@ class WorkspaceServiceTestCase(unittest.TestCase):
             "rolled-back",
         )
 
+    def test_verified_rollback_restores_an_ownerless_task(self) -> None:
+        task = self.service.create_task(
+            "Ownerless write",
+            "Restore the original ownerless state",
+        )
+        self.service.authorize_workspace(task.task_id, "writer", self.workspace)
+        outcome = self.service.handoff(task.task_id, "writer", self.workspace)
+
+        self.assertEqual(outcome.task.active_agent, "writer")
+        self.assertIsNone(outcome.task.actions[-1].details["source_agent"])
+        (self.workspace / "generated.txt").unlink()
+        rolled_back = self.service.verify_workspace_rollback(
+            task.task_id,
+            outcome.action_id,
+            outcome.task.revision,
+            self.workspace,
+        )
+
+        self.assertEqual(rolled_back.status, "active")
+        self.assertIsNone(rolled_back.active_agent)
+
+    def test_legacy_rollback_without_recorded_owner_fails_closed(self) -> None:
+        task = self.new_task()
+        self.service.authorize_workspace(task.task_id, "writer", self.workspace)
+        outcome = self.service.handoff(task.task_id, "writer", self.workspace)
+        checkpoint = self.store.get_task(task.task_id)
+        checkpoint.actions[-1].details.pop("source_agent")
+        checkpoint = self.store.save_task(checkpoint, checkpoint.revision)
+        (self.workspace / "generated.txt").unlink()
+
+        with self.assertRaisesRegex(ConflictError, "prior active agent"):
+            self.service.verify_workspace_rollback(
+                task.task_id,
+                outcome.action_id,
+                checkpoint.revision,
+                self.workspace,
+            )
+
+        persisted = self.store.get_task(task.task_id)
+        self.assertEqual(persisted.status, "blocked")
+        self.assertEqual(
+            persisted.actions[-1].details["workspace_review"]["status"],
+            "pending",
+        )
+
+    def test_malformed_recorded_rollback_owner_is_rejected(self) -> None:
+        task = self.new_task()
+        self.service.authorize_workspace(task.task_id, "writer", self.workspace)
+        outcome = self.service.handoff(task.task_id, "writer", self.workspace)
+        checkpoint = self.store.get_task(task.task_id)
+        checkpoint.actions[-1].details["source_agent"] = 7
+        checkpoint = self.store.save_task(checkpoint, checkpoint.revision)
+        (self.workspace / "generated.txt").unlink()
+
+        with self.assertRaisesRegex(ValidationError, "string or null"):
+            self.service.verify_workspace_rollback(
+                task.task_id,
+                outcome.action_id,
+                checkpoint.revision,
+                self.workspace,
+            )
+
     def test_ambiguous_write_failure_never_falls_back_or_resolves_without_rollback(self) -> None:
         self.register_writer("failing-writer", "fail")
         task = self.new_task()
