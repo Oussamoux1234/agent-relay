@@ -944,6 +944,16 @@ class RelayService:
         source_action, review = self._workspace_review(checkpoint, source_action_id)
         if review.status in {"accepted", "rolled-back"}:
             raise ConflictError("workspace review is already resolved")
+        if "source_agent" not in source_action.details:
+            raise ConflictError(
+                "workspace write action does not record its prior active agent; "
+                "automatic owner restoration is unsafe"
+            )
+        source_agent = source_action.details["source_agent"]
+        if source_agent is not None and not isinstance(source_agent, str):
+            raise ValidationError(
+                "workspace write action source_agent must be a string or null"
+            )
         root = self.workspace_inspector.validate_working_directory(
             working_directory,
             review.workspace_root,
@@ -974,9 +984,7 @@ class RelayService:
             source_action.status = "cancelled"
             source_action.finished_at = reviewed_at
             source_action.details["resolved_by"] = "verified-workspace-rollback"
-        source_agent = source_action.details.get("source_agent")
-        if isinstance(source_agent, str):
-            checkpoint.active_agent = source_agent
+        checkpoint.active_agent = source_agent
         checkpoint.actions.append(
             ActionRecord(
                 action_id=rollback_action_id,
