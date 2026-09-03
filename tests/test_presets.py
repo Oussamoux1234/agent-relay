@@ -17,6 +17,56 @@ from agent_relay.service import RelayService
 from agent_relay.storage import RelayStore
 
 
+CODEX_EXPECTED_CONTAINMENT_ARGUMENTS = (
+    "-c",
+    'web_search="disabled"',
+    "-c",
+    "mcp_servers={}",
+    "--disable",
+    "apps",
+    "--disable",
+    "plugins",
+    "--disable",
+    "remote_plugin",
+    "--disable",
+    "hooks",
+    "--disable",
+    "browser_use",
+    "--disable",
+    "browser_use_external",
+    "--disable",
+    "browser_use_full_cdp_access",
+    "--disable",
+    "computer_use",
+    "--disable",
+    "in_app_browser",
+    "--disable",
+    "image_generation",
+    "--disable",
+    "skill_mcp_dependency_install",
+    "--disable",
+    "tool_suggest",
+)
+
+CODEX_EXPECTED_READ_PERMISSION_ARGUMENTS = (
+    "-c",
+    'default_permissions="agent-relay-read"',
+    "-c",
+    'permissions.agent-relay-read={filesystem={":minimal"="read",'
+    '":workspace_roots"={"."="read"}},network={enabled=false}}',
+)
+
+CODEX_EXPECTED_WRITE_PERMISSION_ARGUMENTS = (
+    "-c",
+    'default_permissions="agent-relay-write"',
+    "-c",
+    'permissions.agent-relay-write={extends=":workspace",filesystem={'
+    '":root"="deny",":minimal"="read",":tmpdir"="deny",'
+    '":slash_tmp"="deny",":workspace_roots"={"."="write"}},'
+    "network={enabled=false}}",
+)
+
+
 EXPECTED_ARGUMENTS = {
     "antigravity-cli": (
         "--mode=plan",
@@ -52,31 +102,31 @@ EXPECTED_ARGUMENTS = {
         "--output-format",
         "json",
     ),
-    "codex-cli": (
+    "codex-cli": CODEX_EXPECTED_CONTAINMENT_ARGUMENTS
+    + CODEX_EXPECTED_READ_PERMISSION_ARGUMENTS
+    + (
         "exec",
-        "--sandbox",
-        "read-only",
+        "--ignore-user-config",
+        "--ignore-rules",
         "--ephemeral",
         "--color",
         "never",
         "-",
     ),
-    "codex-app-server": ("app-server", "--listen", "stdio://"),
-    "codex-app-server-write": ("app-server", "--listen", "stdio://"),
+    "codex-app-server": CODEX_EXPECTED_CONTAINMENT_ARGUMENTS
+    + ("app-server", "--listen", "stdio://"),
+    "codex-app-server-write": CODEX_EXPECTED_CONTAINMENT_ARGUMENTS
+    + ("app-server", "--listen", "stdio://"),
     "codex-cli-write": (
         "--ask-for-approval",
         "on-request",
-        "-c",
-        "sandbox_workspace_write.exclude_slash_tmp=true",
-        "-c",
-        "sandbox_workspace_write.exclude_tmpdir_env_var=true",
-        "-c",
-        "sandbox_workspace_write.network_access=false",
+    )
+    + CODEX_EXPECTED_CONTAINMENT_ARGUMENTS
+    + CODEX_EXPECTED_WRITE_PERMISSION_ARGUMENTS
+    + (
         "exec",
         "--ignore-user-config",
         "--ignore-rules",
-        "--sandbox",
-        "workspace-write",
         "--ephemeral",
         "--color",
         "never",
@@ -191,6 +241,55 @@ class ProviderPresetTestCase(unittest.TestCase):
         self.assertNotIn("--allow-all-tools", arguments)
         self.assertNotIn("--allow-all-paths", arguments)
         self.assertNotIn("--allow-all-urls", arguments)
+
+    def test_codex_presets_disable_surfaces_outside_command_sandbox(self) -> None:
+        for preset_id in (
+            "codex-cli",
+            "codex-cli-write",
+            "codex-app-server",
+            "codex-app-server-write",
+        ):
+            with self.subTest(preset_id=preset_id):
+                arguments = PRESETS[preset_id].fixed_arguments
+                self.assertIn('web_search="disabled"', arguments)
+                self.assertIn("mcp_servers={}", arguments)
+                disabled_features = {
+                    arguments[index + 1]
+                    for index, argument in enumerate(arguments[:-1])
+                    if argument == "--disable"
+                }
+                self.assertTrue(
+                    {
+                        "apps",
+                        "plugins",
+                        "remote_plugin",
+                        "hooks",
+                        "browser_use",
+                        "computer_use",
+                        "in_app_browser",
+                    }.issubset(disabled_features)
+                )
+
+        for preset_id in ("codex-cli", "codex-cli-write"):
+            with self.subTest(preset_id=preset_id):
+                arguments = PRESETS[preset_id].fixed_arguments
+                self.assertIn("--ignore-user-config", arguments)
+                self.assertIn("--ignore-rules", arguments)
+
+        read_arguments = PRESETS["codex-cli"].fixed_arguments
+        self.assertIn('default_permissions="agent-relay-read"', read_arguments)
+        self.assertIn(
+            CODEX_EXPECTED_READ_PERMISSION_ARGUMENTS[-1],
+            read_arguments,
+        )
+        write_arguments = PRESETS["codex-cli-write"].fixed_arguments
+        self.assertIn('default_permissions="agent-relay-write"', write_arguments)
+        self.assertIn(
+            CODEX_EXPECTED_WRITE_PERMISSION_ARGUMENTS[-1],
+            write_arguments,
+        )
+        self.assertNotIn("--sandbox", read_arguments)
+        self.assertNotIn("--sandbox", write_arguments)
 
     def test_claude_write_preset_is_restricted_to_repository_file_tools(self) -> None:
         arguments = PRESETS["claude-code-write"].fixed_arguments

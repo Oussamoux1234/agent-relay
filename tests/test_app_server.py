@@ -68,13 +68,24 @@ if workspace_write:
     assert turn_request["params"]["sandboxPolicy"] == {
         "type": "workspaceWrite",
         "writableRoots": [str(__import__("pathlib").Path.cwd())],
+        "readOnlyAccess": {
+            "type": "restricted",
+            "includePlatformDefaults": True,
+            "readableRoots": [str(__import__("pathlib").Path.cwd())],
+        },
         "networkAccess": False,
         "excludeTmpdirEnvVar": True,
         "excludeSlashTmp": True,
     }
 else:
     assert turn_request["params"]["sandboxPolicy"] == {
-        "type": "readOnly", "networkAccess": False
+        "type": "readOnly",
+        "access": {
+            "type": "restricted",
+            "includePlatformDefaults": True,
+            "readableRoots": [str(__import__("pathlib").Path.cwd())],
+        },
+        "networkAccess": False,
     }
 prompt = turn_request["params"]["input"][0]["text"]
 payload = json.loads(prompt[prompt.index("{"):])
@@ -208,6 +219,16 @@ class CodexAppServerAdapterTestCase(unittest.TestCase):
         self.assertEqual(requests[2]["method"], "thread/start")
         self.assertEqual(requests[3]["method"], "turn/start")
 
+        policy = requests[3]["params"]["sandboxPolicy"]
+        self.assertEqual(
+            policy["access"],
+            {
+                "type": "restricted",
+                "includePlatformDefaults": True,
+                "readableRoots": [str(self.root.resolve())],
+            },
+        )
+
     def test_resumes_explicit_thread_and_declines_command_approval(self) -> None:
         result = CodexAppServerAdapter().execute_session(
             self.spec("approval"),
@@ -235,6 +256,14 @@ class CodexAppServerAdapterTestCase(unittest.TestCase):
         self.assertEqual(requests[2]["params"]["approvalPolicy"], "on-request")
         policy = requests[3]["params"]["sandboxPolicy"]
         self.assertEqual(policy["writableRoots"], [str(self.root.resolve())])
+        self.assertEqual(
+            policy["readOnlyAccess"],
+            {
+                "type": "restricted",
+                "includePlatformDefaults": True,
+                "readableRoots": [str(self.root.resolve())],
+            },
+        )
         self.assertFalse(policy["networkAccess"])
         self.assertTrue(policy["excludeTmpdirEnvVar"])
         self.assertTrue(policy["excludeSlashTmp"])

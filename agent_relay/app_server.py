@@ -72,6 +72,11 @@ class CodexAppServerAdapter:
         spec: AgentSpec,
         working_directory: Path,
     ) -> Tuple[str, str, Dict[str, Any]]:
+        restricted_reads = {
+            "type": "restricted",
+            "includePlatformDefaults": True,
+            "readableRoots": [str(working_directory)],
+        }
         if spec.permission_profile == "workspace-write":
             return (
                 "on-request",
@@ -79,6 +84,7 @@ class CodexAppServerAdapter:
                 {
                     "type": "workspaceWrite",
                     "writableRoots": [str(working_directory)],
+                    "readOnlyAccess": restricted_reads,
                     "networkAccess": False,
                     "excludeTmpdirEnvVar": True,
                     "excludeSlashTmp": True,
@@ -89,6 +95,7 @@ class CodexAppServerAdapter:
             "read-only",
             {
                 "type": "readOnly",
+                "access": restricted_reads,
                 "networkAccess": False,
             },
         )
