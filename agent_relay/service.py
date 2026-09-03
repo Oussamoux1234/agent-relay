@@ -367,6 +367,7 @@ class RelayService:
             }
         checkpoint = self.store.save_task(checkpoint, expected_revision)
 
+        deferred_exception: Optional[BaseException] = None
         try:
             if is_session_adapter:
                 execution = runtime_adapter.execute_session(
@@ -377,9 +378,11 @@ class RelayService:
                 )
             else:
                 execution = runtime_adapter.execute(target, prompt, working_directory)
-        except Exception as exc:
+        except BaseException as exc:
             # Once the pending action is durable, an adapter exception cannot prove that no
-            # external effect occurred. Preserve only the exception type and fail closed.
+            # external effect occurred. Finalize the ledger before propagating interrupts.
+            if not isinstance(exc, Exception):
+                deferred_exception = exc
             execution = AgentExecutionResult(
                 status="unknown",
                 return_code=None,
@@ -433,7 +436,9 @@ class RelayService:
                         before_snapshot,
                         after_snapshot,
                     )
-                except Exception:
+                except BaseException as exc:
+                    if deferred_exception is None and not isinstance(exc, Exception):
+                        deferred_exception = exc
                     workspace_review = self.workspace_inspector.unavailable(
                         before_snapshot,
                         "post-run-workspace-inspection-failed",
@@ -477,7 +482,7 @@ class RelayService:
             persisted_action.status = "failed"
             checkpoint.status = "active"
         checkpoint = self.store.save_task(checkpoint, expected_revision)
-        return HandoffOutcome(
+        outcome = HandoffOutcome(
             task=checkpoint,
             prompt=prompt,
             dry_run=False,
@@ -488,6 +493,9 @@ class RelayService:
             result_error_code=extraction.error_code,
             workspace_review=workspace_review,
         )
+        if deferred_exception is not None:
+            raise deferred_exception
+        return outcome
 
     def configure_route(self, task_id: str, routing_order: List[str]) -> TaskCheckpoint:
         """Persist an explicit, analysis-only fallback order for a task."""
@@ -588,7 +596,20 @@ class RelayService:
             )
             self.store.save_task(checkpoint, expected_revision)
 
-            execution = runtime_adapter.execute(target, last_prompt, resolved_directory)
+            deferred_exception: Optional[BaseException] = None
+            try:
+                execution = runtime_adapter.execute(target, last_prompt, resolved_directory)
+            except BaseException as exc:
+                deferred_exception = exc
+                execution = AgentExecutionResult(
+                    status="unknown",
+                    return_code=None,
+                    stdout="",
+                    stderr="",
+                    elapsed_ms=0,
+                    started=True,
+                    error="runtime adapter raised unexpectedly: %s" % type(exc).__name__,
+                )
             classification = self.classifier.classify(target, execution)
             health_observed_at = self._now()
             health_record = self.cooldown_policy.create_record(
@@ -678,6 +699,8 @@ class RelayService:
                     result_error_code=extraction.error_code,
                 )
             )
+            if deferred_exception is not None:
+                raise deferred_exception
             if execution.status == "completed" or not classification.safe_to_fallback or not has_next:
                 return RouteOutcome(
                     task=checkpoint,

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from agent_relay.adapters import CliAgentAdapter
 from agent_relay.errors import ConflictError, ValidationError
 from agent_relay.models import AgentSpec
 from agent_relay.service import RelayService
@@ -168,6 +173,61 @@ class RelayTestCase(unittest.TestCase):
         self.assertEqual(outcome.execution.status, "unknown")
         self.assertEqual(outcome.task.status, "blocked")
         self.assertEqual(outcome.task.active_agent, "codex")
+
+    def test_keyboard_interrupt_terminates_and_reaps_provider_group(self) -> None:
+        adapter = CliAgentAdapter()
+        descendant_pid = self.root / "descendant.pid"
+        child_code = (
+            "import os, pathlib, signal, sys, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
+            "time.sleep(60)"
+        )
+        provider_code = (
+            "import subprocess, sys, time; "
+            "subprocess.Popen([sys.executable, '-c', %r, %r]); "
+            "time.sleep(60)"
+        ) % (child_code, str(descendant_pid))
+        spec = AgentSpec(
+            agent_id="interruptible-agent",
+            display_name="Interruptible agent",
+            command=(sys.executable, "-c", provider_code),
+            timeout_seconds=30,
+        )
+        started = []
+        real_popen = subprocess.Popen
+
+        def interrupting_popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            started.append(process)
+
+            def interrupt(*_args, **_kwargs):
+                deadline = time.monotonic() + 3
+                while not descendant_pid.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                if not descendant_pid.exists():
+                    raise AssertionError("provider descendant did not start")
+                raise KeyboardInterrupt
+
+            process.communicate = interrupt
+            return process
+
+        try:
+            with mock.patch(
+                "agent_relay.adapters.subprocess.Popen",
+                side_effect=interrupting_popen,
+            ), self.assertRaises(KeyboardInterrupt):
+                adapter.execute(spec, "interrupt me", self.root)
+        finally:
+            for process in started:
+                if process.poll() is None:
+                    CliAgentAdapter._terminate_process_group(process)
+
+        self.assertEqual(len(started), 1)
+        self.assertTrue(descendant_pid.exists())
+        self.assertIsNotNone(started[0].poll())
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(started[0].pid, 0)
 
     def test_preflight_failure_does_not_create_a_pending_action(self) -> None:
         self.register("codex", "print('source')")

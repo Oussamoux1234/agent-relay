@@ -124,25 +124,56 @@ class CliAgentAdapter:
         return value.decode("utf-8", errors="replace")
 
     @staticmethod
+    def _process_group_exists(process_group_id: int) -> bool:
+        try:
+            os.killpg(process_group_id, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+    @staticmethod
     def _terminate_process_group(process: subprocess.Popen) -> None:
-        if process.poll() is not None:
-            return
+        # The session leader may have exited while descendants remain alive. Signal the
+        # known process-group ID even when poll() already observed the leader's exit.
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
-            process.wait()
-            return
+            pass
+        except OSError:
+            try:
+                process.terminate()
+            except OSError:
+                pass
         try:
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
+            pass
+        except (ChildProcessError, OSError):
+            pass
+
+        if CliAgentAdapter._process_group_exists(process.pid):
             try:
                 os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            except OSError:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
             try:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 pass
+            except (ChildProcessError, OSError):
+                pass
+
+            deadline = time.monotonic() + 2
+            while (
+                CliAgentAdapter._process_group_exists(process.pid)
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
 
     @staticmethod
     def validate_execution(spec: AgentSpec, prompt: str, working_directory: Path) -> Path:
@@ -204,7 +235,17 @@ class CliAgentAdapter:
             except subprocess.TimeoutExpired:
                 timed_out = True
                 self._terminate_process_group(process)
-                process.communicate()
+            except BaseException:
+                # Includes KeyboardInterrupt/SystemExit: never let a detached provider
+                # survive an interruption delivered to Relay.
+                self._terminate_process_group(process)
+                raise
+            finally:
+                if process.stdin is not None:
+                    try:
+                        process.stdin.close()
+                    except (BrokenPipeError, OSError):
+                        pass
 
             elapsed_ms = int((time.monotonic() - start) * 1000)
             stdout = self._read_tail(stdout_file)

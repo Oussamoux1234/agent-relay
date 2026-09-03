@@ -57,6 +57,22 @@ class FailSecondSnapshotInspector(WorkspaceInspector):
         return super().snapshot(workspace_root)
 
 
+class InterruptingWriteAdapter:
+    adapter_type = "interrupting-write"
+
+    @staticmethod
+    def validate_execution(spec: AgentSpec, prompt: str, working_directory: Path) -> Path:
+        return Path(working_directory).resolve()
+
+    @staticmethod
+    def execute(spec: AgentSpec, prompt: str, working_directory: Path):
+        (working_directory / "interrupted.txt").write_text(
+            "provider may have changed this\n",
+            encoding="utf-8",
+        )
+        raise KeyboardInterrupt
+
+
 class WorkspaceTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -704,6 +720,44 @@ class WorkspaceServiceTestCase(unittest.TestCase):
             self.workspace,
         )
         self.assertEqual(recovered.status, "active")
+
+    def test_interrupted_write_persists_unknown_action_and_post_run_snapshot(self) -> None:
+        self.service.adapters.register(InterruptingWriteAdapter())
+        self.service.register_agent(
+            AgentSpec(
+                agent_id="interrupting-writer",
+                display_name="Interrupting writer",
+                command=("unused",),
+                capabilities=("repo-read", "repo-write"),
+                provider_id="codex-cli-write",
+                permission_profile="workspace-write",
+                adapter_type="interrupting-write",
+            )
+        )
+        task = self.new_task()
+        self.service.authorize_workspace(
+            task.task_id,
+            "interrupting-writer",
+            self.workspace,
+        )
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.service.handoff(
+                task.task_id,
+                "interrupting-writer",
+                self.workspace,
+            )
+
+        persisted = self.store.get_task(task.task_id)
+        action = persisted.actions[-1]
+        self.assertEqual(action.status, "unknown")
+        self.assertEqual(persisted.status, "blocked")
+        self.assertEqual(persisted.active_agent, "source")
+        self.assertEqual(action.details["workspace_review"]["status"], "pending")
+        self.assertEqual(
+            action.details["workspace_review"]["introduced_paths"],
+            ["interrupted.txt"],
+        )
 
     def test_cli_exposes_authorize_review_and_accept_flow(self) -> None:
         task = self.new_task()
