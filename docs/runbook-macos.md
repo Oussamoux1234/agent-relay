@@ -78,10 +78,12 @@ agent-relay agent presets
 
 Missing providers are reported as unavailable and can simply remain unregistered.
 
-## 3. Register read agents
+## 3. Register agents
 
-Read/plan presets are the default and are the only presets accepted in automatic
-quota fallback routes:
+Register only the installed providers you intend to use. Codex CLI, Claude Code,
+and GitHub Copilot read presets are eligible for automatic quota fallback routes.
+Gemini and Antigravity plan presets are explicit-handoff-only because their
+headless plan modes do not enforce repository read-only access:
 
 ```bash
 agent-relay agent add-preset codex-cli --id codex-read
@@ -136,8 +138,6 @@ entry must be a read/plan preset, and the first entry must be the active agent:
 agent-relay route set TASK_ID \
   --agent codex-read \
   --agent claude-read \
-  --agent gemini-read \
-  --agent antigravity-read \
   --agent copilot-read
 
 agent-relay route show TASK_ID
@@ -149,12 +149,25 @@ Relay advances only after a recognized quota/rate-limit failure or a process tha
 never started. Authentication failures, timeouts, overload, and unknown failures
 block instead of falling back.
 
+`route set` rejects Gemini and Antigravity registrations, including registrations
+already present in an older stored route. To invoke one manually, preview and then
+execute an explicit handoff inside an OS-enforced read-only environment:
+
+```bash
+agent-relay handoff TASK_ID gemini-read
+agent-relay handoff TASK_ID gemini-read --execute --cwd "$(git rev-parse --show-toplevel)"
+```
+
+The same rule applies to `antigravity-read`. Its plan-mode label is not a hard
+filesystem boundary.
+
 ## 5. Run an explicitly reviewed write
 
 Supported write presets are `codex-cli-write`, `codex-app-server-write`, and
 `claude-code-write`. Claude Code write mode requires Claude Code 2.1.248 or newer.
-Gemini and Antigravity remain read/plan-only because their current settings model
-does not give Relay a sufficiently predictable exact-root write boundary.
+Gemini and Antigravity remain manual-only because their current settings model
+does not give Relay a sufficiently predictable read-only or exact-root write
+boundary.
 
 Register a separate writer; do not replace the read registration:
 

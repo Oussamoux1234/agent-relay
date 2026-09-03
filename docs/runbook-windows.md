@@ -115,9 +115,12 @@ agent-relay agent presets
 
 Relay reuses these local logins and never stores provider token values.
 
-## 4. Register read agents and a route
+## 4. Register agents and a route
 
-Register only installed providers:
+Register only installed providers. Codex CLI, Claude Code, and GitHub Copilot read
+presets are eligible for automatic routes. Gemini and Antigravity are available
+only for explicit handoffs because their headless plan modes do not enforce
+repository read-only access:
 
 ```bash
 agent-relay agent add-preset codex-cli --id codex-read
@@ -139,8 +142,6 @@ agent-relay task create \
 agent-relay route set TASK_ID \
   --agent codex-read \
   --agent claude-read \
-  --agent gemini-read \
-  --agent antigravity-read \
   --agent copilot-read
 
 agent-relay route show TASK_ID
@@ -148,16 +149,29 @@ agent-relay route run TASK_ID
 agent-relay route run TASK_ID --execute --cwd "$(git rev-parse --show-toplevel)"
 ```
 
-Only read/plan presets can enter a fallback route. Relay falls through only for a
-recognized quota/rate-limit result or a process that did not start. Ambiguous and
-authentication failures block.
+`route set` accepts only the Codex CLI, Claude Code, and GitHub Copilot read
+presets. Relay falls through only for a recognized quota/rate-limit result or a
+process that did not start. Ambiguous and authentication failures block.
+
+Gemini and Antigravity registrations, including registrations found in older
+stored routes, are rejected before any automatic-route provider launches. To use
+one manually, preview and explicitly execute the handoff inside an OS-enforced
+read-only environment:
+
+```bash
+agent-relay handoff TASK_ID gemini-read
+agent-relay handoff TASK_ID gemini-read --execute --cwd "$(git rev-parse --show-toplevel)"
+```
+
+The same rule applies to `antigravity-read`. Its plan-mode label is not a hard
+filesystem boundary.
 
 ## 5. Run an explicitly reviewed write
 
 Supported write presets are `codex-cli-write`, `codex-app-server-write`, and
 `claude-code-write`. Claude Code write mode requires Claude Code 2.1.248 or newer.
-Gemini and Antigravity stay read/plan-only until their native controls can guarantee
-the same exact-root boundary.
+Gemini and Antigravity stay manual-only until their native controls can guarantee
+a read-only or exact-root boundary.
 
 Register a writer separately from the read agent:
 
