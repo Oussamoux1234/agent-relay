@@ -290,6 +290,16 @@ python3 -m agent_relay handoff TASK_ID codex-writer \
 
 Relay records a bounded snapshot before launch and another after the process returns. The review contains SHA-256 state digests, HEAD and branch changes, pre-existing dirty paths, introduced/modified/removed paths, and final dirty paths. Tracked, staged, untracked, and ignored paths are covered; snapshot format v2 hashes the mode, object ID, and conflict stage of each relevant Git index entry separately from the working-tree file. Repositories containing `assume-unchanged` or `skip-worktree` entries fail closed because those flags can hide edits from Git status. File contents, staged blobs, and raw diffs are never copied into Relay state. Inspection is limited to 2,000 relevant paths, 128 MiB per file, 512 MiB total, and 2 MiB per Git command output so an unbounded repository fails before execution or blocks safely after execution.
 
+The persisted checkpoint keeps the complete content-free review and action ledger.
+Handoff prompts use a separate bounded projection: at most 16 actions are included,
+prioritizing the required target action and unresolved entries before recent history.
+Omitted actions are reported with deterministic status/kind counts, including a
+separate unresolved count. Each projected workspace review retains its status,
+snapshot/HEAD digests, branch transition, per-category path counts, and at most four
+deterministically selected path samples. Use `agent-relay task show TASK_ID` for the
+full action ledger or `agent-relay workspace review TASK_ID ACTION_ID` for the full
+review; prompt truncation never edits the stored audit record.
+
 Workspace reviews written before v0.7.1 remain readable. Relay can verify an old snapshot only when its current state has no staged paths; legacy reviews involving staged content fail closed and should be resolved with v0.7.0 before upgrading. New reviews record their snapshot version explicitly.
 
 If a successful run changed the snapshot, the task stays blocked. Ask Relay for the review metadata, then inspect the actual repository diff with Git:
@@ -541,6 +551,8 @@ independently from command-network isolation. Version 0.9.6 confines Claude read
 handoffs with restricted and safe modes, a read-only tool allowlist, and no local
 customizations or persistence. Version 0.9.7 gives Copilot a dedicated ephemeral
 adapter, disables untrusted hooks and configuration, and requires its OS-backed
-repository-read/network-denied sandbox to fail closed. New provider write presets will be added only when
+repository-read/network-denied sandbox to fail closed. Version 0.9.8 keeps complete
+workspace audits on disk while rendering bounded action history and deterministic
+review path samples into handoff prompts. New provider write presets will be added only when
 current official controls can preserve the same exact task/agent/root and review
 boundary.
