@@ -1,6 +1,11 @@
 """Agent Relay: portable checkpoints and safe handoffs between AI agents."""
 
-from .adapters import AdapterRegistry, AntigravityCliAdapter, SessionAgentAdapter
+from .adapters import (
+    AdapterRegistry,
+    AntigravityCliAdapter,
+    CopilotCliAdapter,
+    SessionAgentAdapter,
+)
 from .app_server import CodexAppServerAdapter
 from .failures import FailureClassification, FailureClassifier
 from .health import AgentHealthRecord, CooldownPolicy, StructuredRetryHintParser
@@ -24,6 +29,7 @@ __all__ = [
     "AgentSpec",
     "AgentHealthRecord",
     "CooldownPolicy",
+    "CopilotCliAdapter",
     "CodexAppServerAdapter",
     "FailureClassification",
     "FailureClassifier",

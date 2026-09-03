@@ -6,9 +6,11 @@ import json
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from agent_relay.adapters import CopilotCliAdapter
 from agent_relay.cli import main
 from agent_relay.errors import NotFoundError, ValidationError
 from agent_relay.models import AgentSpec
@@ -150,10 +152,11 @@ EXPECTED_ARGUMENTS = {
     "github-copilot": (
         "-s",
         "--available-tools=view,glob,grep",
-        "--deny-tool=write,shell,url,memory",
+        "--deny-tool=write,create,edit,shell,powershell,url,memory,task,web_fetch",
         "--disable-builtin-mcps",
         "--no-custom-instructions",
-        "--no-experimental",
+        "--experimental",
+        "--sandbox",
         "--no-remote",
         "--no-remote-export",
         "--disallow-temp-dir",
@@ -198,8 +201,23 @@ class ProviderPresetTestCase(unittest.TestCase):
                 else "prompt = raw\n"
             )
             + "config_home = os.environ.get(config_environment) if config_environment else None\n"
+            + "settings = {}\n"
+            + "auth_state_present = False\n"
+            + "auth_state_keys = []\n"
+            + "if config_home:\n"
+            + "    settings_path = os.path.join(config_home, 'settings.json')\n"
+            + "    if os.path.isfile(settings_path):\n"
+            + "        with open(settings_path, encoding='utf-8') as handle:\n"
+            + "            settings = json.load(handle)\n"
+            + "    auth_path = os.path.join(config_home, 'config.json')\n"
+            + "    auth_state_present = os.path.isfile(auth_path)\n"
+            + "    if auth_state_present:\n"
+            + "        with open(auth_path, encoding='utf-8') as handle:\n"
+            + "            auth_state_keys = sorted(json.load(handle))\n"
             + "print(json.dumps({'received': 'portable checkpoint reaches' in prompt, "
-            + "'config_home': config_home}))\n",
+            + "'config_home': config_home, 'cache_home': os.environ.get('COPILOT_CACHE_HOME'), "
+            + "'settings': settings, 'auth_state_present': auth_state_present, "
+            + "'auth_state_keys': auth_state_keys}))\n",
             encoding="utf-8",
         )
         executable.chmod(0o700)
@@ -220,6 +238,7 @@ class ProviderPresetTestCase(unittest.TestCase):
             statuses["claude-code-write"]["minimum_version"],
             "2.1.248",
         )
+        self.assertEqual(statuses["github-copilot"]["minimum_version"], "1.0.79")
         self.assertIsNone(statuses["codex-cli"]["minimum_version"])
 
     def test_presets_have_reviewed_permission_bounded_invocations(self) -> None:
@@ -248,14 +267,120 @@ class ProviderPresetTestCase(unittest.TestCase):
         arguments = PRESETS["github-copilot"].fixed_arguments
 
         self.assertIn("--available-tools=view,glob,grep", arguments)
-        self.assertIn("--deny-tool=write,shell,url,memory", arguments)
+        self.assertIn(
+            "--deny-tool=write,create,edit,shell,powershell,url,memory,task,web_fetch",
+            arguments,
+        )
         self.assertIn("--disable-builtin-mcps", arguments)
         self.assertIn("--no-custom-instructions", arguments)
+        self.assertIn("--experimental", arguments)
+        self.assertIn("--sandbox", arguments)
         self.assertIn("--no-remote", arguments)
+        self.assertNotIn("--no-experimental", arguments)
         self.assertNotIn("--allow-all", arguments)
         self.assertNotIn("--allow-all-tools", arguments)
         self.assertNotIn("--allow-all-paths", arguments)
         self.assertNotIn("--allow-all-urls", arguments)
+
+    def test_copilot_execution_uses_ephemeral_fail_closed_configuration(self) -> None:
+        self.service.register_agent(
+            AgentSpec(
+                agent_id="source",
+                display_name="Source",
+                command=(sys.executable, "-c", "print('source')"),
+            )
+        )
+        source_home = self.root / "copilot-source"
+        source_home.mkdir()
+        (source_home / "config.json").write_text(
+            "// Copilot managed state\n"
+            + json.dumps(
+                {
+                    "loggedInUsers": [
+                        {"host": "https://github.com", "login": "fixture"}
+                    ],
+                    "installedPlugins": {"hostile": "/tmp/hostile"},
+                    "disableAllHooks": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        executable = self.make_fake_provider("github-copilot")
+        self.service.register_agent(
+            build_preset(
+                "github-copilot",
+                executable=str(executable),
+                config_home=str(source_home),
+            )
+        )
+        task = self.service.create_task(
+            "Copilot containment",
+            "Prove a portable checkpoint reaches every provider",
+            active_agent="source",
+        )
+
+        outcome = self.service.handoff(task.task_id, "github-copilot", self.root)
+
+        response = json.loads(outcome.execution.stdout)
+        isolated_home = Path(response["config_home"])
+        sandbox = response["settings"]["sandbox"]
+        self.assertEqual(outcome.execution.status, "completed")
+        self.assertNotEqual(isolated_home, source_home)
+        self.assertFalse(isolated_home.exists())
+        self.assertTrue(response["auth_state_present"])
+        self.assertEqual(response["auth_state_keys"], ["loggedInUsers"])
+        self.assertEqual(response["cache_home"], str(isolated_home / "cache"))
+        self.assertTrue(response["settings"]["disableAllHooks"])
+        self.assertEqual(
+            response["settings"]["permissions"]["disableBypassPermissionsMode"],
+            "disable",
+        )
+        self.assertTrue(sandbox["enabled"])
+        self.assertTrue(sandbox["failIfUnavailable"])
+        self.assertFalse(sandbox["allowBypass"])
+        self.assertFalse(sandbox["addCurrentWorkingDirectory"])
+        self.assertFalse(sandbox["allowDevToolAccess"])
+        self.assertEqual(sandbox["auth"], {"gh": False, "git": False})
+        self.assertEqual(
+            sandbox["userPolicy"]["filesystem"]["readwritePaths"],
+            [],
+        )
+        self.assertEqual(
+            sandbox["userPolicy"]["filesystem"]["readonlyPaths"],
+            [str(self.root.resolve())],
+        )
+        self.assertFalse(sandbox["userPolicy"]["network"]["allowOutbound"])
+        self.assertFalse(sandbox["userPolicy"]["network"]["allowLocalNetwork"])
+
+    def test_copilot_adapter_rejects_modified_presets_before_launch(self) -> None:
+        executable = self.make_fake_provider("github-copilot")
+        reviewed = build_preset(
+            "github-copilot",
+            agent_id="copilot-unsafe",
+            executable=str(executable),
+        )
+        unsafe = replace(reviewed, command=reviewed.command + ("--yolo",))
+
+        with self.assertRaises(ValidationError):
+            CopilotCliAdapter().validate_execution(unsafe, "inspect", self.root)
+
+    def test_copilot_adapter_does_not_follow_auth_state_symlinks(self) -> None:
+        source_home = self.root / "copilot-symlink-source"
+        source_home.mkdir()
+        external = self.root / "external-config.json"
+        external.write_text('{"token": "must-not-copy"}', encoding="utf-8")
+        (source_home / "config.json").symlink_to(external)
+        executable = self.make_fake_provider("github-copilot")
+        spec = build_preset(
+            "github-copilot",
+            executable=str(executable),
+            config_home=str(source_home),
+        )
+
+        result = CopilotCliAdapter().execute(spec, "inspect", self.root)
+
+        self.assertEqual(result.status, "completed")
+        self.assertFalse(json.loads(result.stdout)["auth_state_present"])
 
     def test_codex_presets_disable_surfaces_outside_command_sandbox(self) -> None:
         for preset_id in (

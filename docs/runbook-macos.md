@@ -77,6 +77,20 @@ agent-relay agent presets
 ```
 
 Missing providers are reported as unavailable and can simply remain unregistered.
+The Copilot preset requires Copilot CLI 1.0.79 or newer because older releases use
+different sandbox authentication and developer-tool-access keys.
+
+Before adding Copilot to an automatic route on a machine image, run its authenticated
+containment fixture once. It consumes one real Copilot request:
+
+```bash
+AGENT_RELAY_RUN_COPILOT_NATIVE_TESTS=1 \
+  python3 -m unittest tests.test_copilot_native -v
+```
+
+Keep Copilot out of automatic routes if this check does not pass. See the
+[Copilot containment boundary](copilot-containment.md), including the exception
+for administrator-installed policy hooks.
 
 ## 3. Register agents
 

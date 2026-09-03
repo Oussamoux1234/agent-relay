@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from .adapters import COPILOT_CONTAINMENT_ARGUMENTS
 from .errors import NotFoundError, ValidationError
 from .models import AgentSpec
 
@@ -260,26 +261,13 @@ PRESETS = {
         default_agent_id="github-copilot",
         display_name="GitHub Copilot CLI",
         executable_name="copilot",
-        fixed_arguments=(
-            "-s",
-            "--available-tools=view,glob,grep",
-            "--deny-tool=write,shell,url,memory",
-            "--disable-builtin-mcps",
-            "--no-custom-instructions",
-            "--no-experimental",
-            "--no-remote",
-            "--no-remote-export",
-            "--disallow-temp-dir",
-            "--no-ask-user",
-            "--no-auto-update",
-            "--no-bash-env",
-            "--no-color",
-            "--log-level=none",
-            "--output-format=json",
-        ),
+        fixed_arguments=COPILOT_CONTAINMENT_ARGUMENTS,
         prompt_transport="stdin",
         capabilities=("repo-read",),
-        permission_profile="read-only",
+        permission_profile="sandbox-read-contained-preview",
+        adapter_type="copilot-cli",
+        config_home_environment="COPILOT_HOME",
+        minimum_version="1.0.79",
     )
 }
 

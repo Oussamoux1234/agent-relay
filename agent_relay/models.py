@@ -20,7 +20,7 @@ ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 ACTION_STATUSES = {"pending", "completed", "failed", "unknown", "cancelled"}
 TASK_STATUSES = {"active", "blocked", "completed"}
 PROMPT_TRANSPORTS = {"stdin", "argument"}
-CONFIG_HOME_ENVIRONMENTS = {"CLAUDE_CONFIG_DIR", "CODEX_HOME"}
+CONFIG_HOME_ENVIRONMENTS = {"CLAUDE_CONFIG_DIR", "CODEX_HOME", "COPILOT_HOME"}
 PERMISSION_PROFILE_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 
 
