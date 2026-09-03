@@ -40,6 +40,60 @@ WORKSPACE_WRITE_CHECKPOINT_STDIN_INSTRUCTION = (
 )
 
 
+# Command sandbox network controls do not contain Codex-hosted tools such as web
+# search, MCP servers, apps, browser/computer use, or hooks. Keep those surfaces
+# off independently for every reviewed Codex preset. Explicit command-line
+# overrides take precedence over a user's normal Codex configuration.
+CODEX_CONTAINMENT_ARGUMENTS = (
+    "-c",
+    'web_search="disabled"',
+    "-c",
+    "mcp_servers={}",
+    "--disable",
+    "apps",
+    "--disable",
+    "plugins",
+    "--disable",
+    "remote_plugin",
+    "--disable",
+    "hooks",
+    "--disable",
+    "browser_use",
+    "--disable",
+    "browser_use_external",
+    "--disable",
+    "browser_use_full_cdp_access",
+    "--disable",
+    "computer_use",
+    "--disable",
+    "in_app_browser",
+    "--disable",
+    "image_generation",
+    "--disable",
+    "skill_mcp_dependency_install",
+    "--disable",
+    "tool_suggest",
+)
+
+CODEX_READ_PERMISSION_ARGUMENTS = (
+    "-c",
+    'default_permissions="agent-relay-read"',
+    "-c",
+    'permissions.agent-relay-read={filesystem={":minimal"="read",'
+    '":workspace_roots"={"."="read"}},network={enabled=false}}',
+)
+
+CODEX_WRITE_PERMISSION_ARGUMENTS = (
+    "-c",
+    'default_permissions="agent-relay-write"',
+    "-c",
+    'permissions.agent-relay-write={extends=":workspace",filesystem={'
+    '":root"="deny",":minimal"="read",":tmpdir"="deny",'
+    '":slash_tmp"="deny",":workspace_roots"={"."="write"}},'
+    "network={enabled=false}}",
+)
+
+
 PRESETS = {
     "antigravity-cli": AgentPreset(
         preset_id="antigravity-cli",
@@ -107,10 +161,12 @@ PRESETS = {
         default_agent_id="codex-cli",
         display_name="OpenAI Codex CLI",
         executable_name="codex",
-        fixed_arguments=(
+        fixed_arguments=CODEX_CONTAINMENT_ARGUMENTS
+        + CODEX_READ_PERMISSION_ARGUMENTS
+        + (
             "exec",
-            "--sandbox",
-            "read-only",
+            "--ignore-user-config",
+            "--ignore-rules",
             "--ephemeral",
             "--color",
             "never",
@@ -129,17 +185,13 @@ PRESETS = {
         fixed_arguments=(
             "--ask-for-approval",
             "on-request",
-            "-c",
-            "sandbox_workspace_write.exclude_slash_tmp=true",
-            "-c",
-            "sandbox_workspace_write.exclude_tmpdir_env_var=true",
-            "-c",
-            "sandbox_workspace_write.network_access=false",
+        )
+        + CODEX_CONTAINMENT_ARGUMENTS
+        + CODEX_WRITE_PERMISSION_ARGUMENTS
+        + (
             "exec",
             "--ignore-user-config",
             "--ignore-rules",
-            "--sandbox",
-            "workspace-write",
             "--ephemeral",
             "--color",
             "never",
@@ -155,7 +207,8 @@ PRESETS = {
         default_agent_id="codex-app",
         display_name="OpenAI Codex App Server",
         executable_name="codex",
-        fixed_arguments=("app-server", "--listen", "stdio://"),
+        fixed_arguments=CODEX_CONTAINMENT_ARGUMENTS
+        + ("app-server", "--listen", "stdio://"),
         prompt_transport="stdin",
         capabilities=("repo-read",),
         permission_profile="app-server-read-only",
@@ -167,7 +220,8 @@ PRESETS = {
         default_agent_id="codex-app-write",
         display_name="OpenAI Codex App Server (workspace write)",
         executable_name="codex",
-        fixed_arguments=("app-server", "--listen", "stdio://"),
+        fixed_arguments=CODEX_CONTAINMENT_ARGUMENTS
+        + ("app-server", "--listen", "stdio://"),
         prompt_transport="stdin",
         capabilities=("repo-read", "repo-write"),
         permission_profile="workspace-write",
