@@ -23,6 +23,7 @@ DIGEST_B = "b" * 64
 HEAD_A = "1" * 40
 HEAD_B = "2" * 40
 TIMESTAMP = "2026-09-03T12:00:00Z"
+WORKSPACE_ROOT = str(Path.cwd() / "workspace" / "project")
 
 
 def prompt_payload(prompt: str):
@@ -35,7 +36,7 @@ def review_with_paths(path_count: int, status: str = "accepted"):
     )
     return WorkspaceReview(
         status=status,
-        workspace_root="/workspace/project",
+        workspace_root=WORKSPACE_ROOT,
         before_digest=DIGEST_A,
         after_digest=DIGEST_B,
         before_head=HEAD_A,

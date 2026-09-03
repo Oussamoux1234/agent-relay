@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import posixpath
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
@@ -36,7 +37,10 @@ def _default_state_dir() -> str:
         return str(base / "agent-relay")
     configured_base = os.environ.get("XDG_STATE_HOME")
     base = Path(configured_base).expanduser() if configured_base else Path.home() / ".local" / "state"
-    if not base.is_absolute():
+    # XDG paths always use POSIX path semantics.  Keeping that validation
+    # independent from the host path flavour also makes platform simulation
+    # reliable in the cross-platform test matrix.
+    if configured_base and not posixpath.isabs(configured_base):
         base = Path.home() / ".local" / "state"
     return str(base / "agent-relay")
 
