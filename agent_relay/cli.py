@@ -25,7 +25,20 @@ from .storage import RelayStore
 
 
 def _default_state_dir() -> str:
-    return os.environ.get("AGENT_RELAY_STATE_DIR", ".agent-relay")
+    configured = os.environ.get("AGENT_RELAY_STATE_DIR")
+    if configured:
+        return configured
+    if sys.platform == "darwin":
+        return str(Path.home() / "Library" / "Application Support" / "agent-relay")
+    if sys.platform == "win32":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+        return str(base / "agent-relay")
+    configured_base = os.environ.get("XDG_STATE_HOME")
+    base = Path(configured_base).expanduser() if configured_base else Path.home() / ".local" / "state"
+    if not base.is_absolute():
+        base = Path.home() / ".local" / "state"
+    return str(base / "agent-relay")
 
 
 def _print_json(value: Any, stream: Any = None) -> None:
@@ -154,7 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--state-dir",
         default=_default_state_dir(),
-        help="local state directory (default: .agent-relay)",
+        help="local state directory (default: %(default)s)",
     )
     commands = parser.add_subparsers(dest="command_name", required=True)
 

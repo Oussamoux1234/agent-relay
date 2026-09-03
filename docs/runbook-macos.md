@@ -247,5 +247,8 @@ otherwise protect repository work.
   `git rev-parse --show-toplevel`; a nested directory is not accepted.
 - **Task is blocked:** inspect `agent-relay task show TASK_ID`. Resolve ordinary
   unknown actions explicitly, or use the workspace review/rollback flow for writes.
-- **State directory rejected:** ensure `.agent-relay`, its `tasks` directory, and its
-  managed files are real local paths, not symlinks. Do not edit state JSON manually.
+- **State directory rejected:** the default is
+  `~/Library/Application Support/agent-relay`. Ensure it, its `tasks` directory, and
+  managed files are real local paths, not symlinks. It must also be outside and
+  disjoint from any Git root authorized for workspace writes. Do not edit state JSON
+  manually.

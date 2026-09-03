@@ -3,12 +3,15 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from agent_relay.cli import main
+import agent_relay.cli as cli_module
+from agent_relay.cli import _default_state_dir, main
 from agent_relay.models import AgentSpec
 from agent_relay.service import RelayService
 from agent_relay.storage import RelayStore
@@ -29,6 +32,47 @@ class CliTestCase(unittest.TestCase):
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             status = main(["--state-dir", self.state_dir, *arguments])
         return status, stdout.getvalue(), stderr.getvalue()
+
+    def test_default_state_directory_uses_per_user_platform_data(self) -> None:
+        home = Path("/users/relay")
+        cases = (
+            ("linux", {}, home / ".local" / "state" / "agent-relay"),
+            (
+                "linux",
+                {"XDG_STATE_HOME": "/var/user-state"},
+                Path("/var/user-state/agent-relay"),
+            ),
+            (
+                "darwin",
+                {},
+                home / "Library" / "Application Support" / "agent-relay",
+            ),
+            (
+                "win32",
+                {"LOCALAPPDATA": r"C:\\Users\\relay\\AppData\\Local"},
+                Path(r"C:\\Users\\relay\\AppData\\Local") / "agent-relay",
+            ),
+        )
+        for platform, environment, expected in cases:
+            with self.subTest(platform=platform, environment=environment), mock.patch.dict(
+                os.environ,
+                environment,
+                clear=True,
+            ), mock.patch.object(cli_module.sys, "platform", platform), mock.patch.object(
+                cli_module.Path,
+                "home",
+                return_value=home,
+            ):
+                self.assertEqual(Path(_default_state_dir()), expected)
+
+    def test_explicit_state_directory_override_is_preserved(self) -> None:
+        configured = str(self.root / "existing-safe-state")
+        with mock.patch.dict(
+            os.environ,
+            {"AGENT_RELAY_STATE_DIR": configured},
+            clear=True,
+        ):
+            self.assertEqual(_default_state_dir(), configured)
 
     def test_cli_register_create_preview_flow(self) -> None:
         status, output, _ = self.invoke(

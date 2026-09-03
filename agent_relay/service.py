@@ -228,6 +228,7 @@ class RelayService:
         self._assert_no_execution_gate(checkpoint, "authorizing workspace writes")
         target = self._get_workspace_write_agent(agent_id)
         root = self.workspace_inspector.validate_root(workspace_root)
+        self.store.require_disjoint_workspace(root)
         current_root = self._active_workspace_authorization(checkpoint, agent_id)
         if current_root is not None:
             raise ConflictError(
@@ -1116,6 +1117,7 @@ class RelayService:
                 "workspace write is not authorized for this task and agent; "
                 "run workspace authorize first"
             )
+        self.store.require_disjoint_workspace(Path(workspace_root))
         return workspace_root
 
     @staticmethod
